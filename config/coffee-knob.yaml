@@ -1,6 +1,5 @@
 # =============================================================================
-# coffee-knob  -  M1 skeleton + M2 read + M3 write + M4 shot timer
-# Waveshare ESP32-S3-Knob-Touch-LCD-1.8 / Guition JC3636K518C-I-YR1
+# coffee-knob - Waveshare ESP32-S3-Knob-Touch-LCD-1.8 / Guition JC3636K518C
 #
 # PROVENANCE - hardware values verbatim from KrX3D/WaveShare-Knob-Esp32S3
 # @ 5e22f98, cross-checked against the board schematic. No pin invented.
@@ -9,14 +8,23 @@
 #   Haptic I2C:   same bus, DRV2605 @ 0x5A, EN strapped 3V3, TRIG to GND
 #   Knob EC1:     A GPIO8, B GPIO7  (EC2 is on the OTHER MCU - not used)
 #   Backlight:    GPIO47 (PWM)
+#
+# INTERACTION MODEL
+#   main:     short tap -> control page       long press -> toggle power
+#   control:  turn -> move / adjust           short tap -> act
+#             long press -> back to main (or START backflush on that item)
+#   shot:     automatic on brewing_active
 # =============================================================================
 
 substitutions:
-  micra_power:    switch.la_minea_micra
-  micra_brewing:  binary_sensor.la_minea_micra_brewing_active
-  screen_timeout: 5min
-  # Seconds of shot at which the progress ring completes a full turn.
-  shot_full_scale_ds: "400"   # deciseconds -> 40.0 s
+  micra_power:       switch.la_minea_micra
+  micra_brewing:     binary_sensor.la_minea_micra_brewing_active
+  micra_steam:       switch.la_minea_micra_steam_boiler
+  micra_steam_level: select.la_minea_micra_steam_level
+  micra_temp:        number.la_minea_micra_coffee_target_temperature
+  micra_backflush:   button.la_minea_micra_start_backflush
+  screen_timeout:    5min
+  shot_full_scale_ds: "400"
 
 esphome:
   name: coffee-knob
@@ -75,7 +83,9 @@ wifi:
 
 captive_portal:
 
-# --- Display: ST77916 over QSPI ---------------------------------------------
+# --- Display: ST77916 over QSPI ---
+# rotation lives on the lvgl: block. LVGL rejects display-level rotation and
+# rotates touch input itself via rotate_coordinates().
 spi:
   id: display_qspi
   type: quad
@@ -98,7 +108,6 @@ display:
       height: 360
       width: 360
 
-# --- Touch: CST816 -----------------------------------------------------------
 i2c:
   sda: 11
   scl: 12
@@ -111,8 +120,6 @@ touchscreen:
     display: main_display
     interrupt_pin: GPIO9
     reset_pin: GPIO10
-    # Leave identity: LVGL rotates touch input itself (rotate_coordinates()),
-    # so mirroring here would double-flip it.
     transform:
       mirror_x: false
       mirror_y: false
@@ -120,7 +127,6 @@ touchscreen:
     on_touch:
       - script.execute: screentime
 
-# --- Backlight ---------------------------------------------------------------
 output:
   - platform: ledc
     pin: GPIO47
@@ -144,9 +150,29 @@ light:
     on_turn_on:
       - lvgl.resume:
 
-# --- Knob: EC1 on GPIO8/GPIO7 ------------------------------------------------
-# NOT a quadrature encoder in the PCNT sense - one pulse per detent, direction
-# encoded by which channel fires. Stock rotary_encoder reads zero here.
+# --- Icons: Material Design Icons webfont ---
+# Vector glyphs: they scale and take colour. Fetched at COMPILE time from
+# raw.githubusercontent (github.com/.../raw/... is proxy-blocked) and baked
+# into the firmware, so nothing is fetched at runtime.
+font:
+  - file: &mdi_ttf "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_64
+    size: 64
+    bpp: 4
+    glyphs: ["\U000F0176"]
+  - file: *mdi_ttf
+    id: mdi_40
+    size: 40
+    bpp: 4
+    glyphs:
+      - "\U000F004D"
+      - "\U000F0425"
+      - "\U000F0493"
+      - "\U000F04D3"
+      - "\U000F050F"
+      - "\U000F0AE0"
+      - "\U000F1319"
+
 external_components:
   - source:
       type: git
@@ -165,9 +191,44 @@ sensor:
     publish_initial_value: true
     restore_mode: ALWAYS_ZERO
     on_clockwise:
-      - script.execute: knob_tick
+      - if:
+          condition:
+            lvgl.page.is_showing: page_cfg
+          then:
+            - script.execute:
+                id: cfg_move
+                delta: 1
+          else:
+            - script.execute: knob_tick
     on_anticlockwise:
-      - script.execute: knob_tick
+      - if:
+          condition:
+            lvgl.page.is_showing: page_cfg
+          then:
+            - script.execute:
+                id: cfg_move
+                delta: -1
+          else:
+            - script.execute: knob_tick
+
+  - platform: homeassistant
+    id: coffee_temp
+    entity_id: $micra_temp
+    internal: true
+    on_value:
+      - lambda: 'if (!id(cfg_edit)) id(coffee_temp_val) = x;'
+      - script.execute: paint_cfg
+
+text_sensor:
+  - platform: homeassistant
+    id: steam_level_txt
+    entity_id: $micra_steam_level
+    internal: true
+    on_value:
+      - lambda: |-
+          int v = atoi(x.c_str());
+          if (v >= 1 && v <= 3) id(steam_level_val) = v;
+      - script.execute: paint_cfg
 
 button:
   - platform: restart
@@ -178,9 +239,6 @@ binary_sensor:
   - platform: status
     name: "Connection Status"
 
-  # Diagnostic only, no action bound. The schematic shows EC1 as a 4-pin
-  # encoder with no push contact, so the knob should NOT be pressable.
-  # GPIO0 carries the only candidate button line - this settles it.
   - platform: gpio
     name: "Knob Button (probe)"
     id: gpio0_probe
@@ -196,17 +254,22 @@ binary_sensor:
     on_press:
       - logger.log: "PROBE: GPIO0 went active - there IS a button on this line"
 
-  # --- M2: read machine power from Home Assistant ---
   - platform: homeassistant
     id: micra_on
     name: "Micra Power (mirror)"
     entity_category: diagnostic
     entity_id: $micra_power
     on_state:
-      - logger.log: "M2: machine state received from HA"
       - script.execute: paint_main
 
-  # --- M4: shot detection ---
+  - platform: homeassistant
+    id: steam_on
+    name: "Steam Boiler (mirror)"
+    entity_category: diagnostic
+    entity_id: $micra_steam
+    on_state:
+      - script.execute: paint_cfg
+
   - platform: homeassistant
     id: micra_brewing
     name: "Micra Brewing (mirror)"
@@ -238,7 +301,7 @@ binary_sensor:
       - script.execute: paint_main
 
 globals:
-  - id: shot_ds          # elapsed shot time in deciseconds (0.1 s units)
+  - id: shot_ds
     type: uint32_t
     restore_value: false
     initial_value: '0'
@@ -246,20 +309,35 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'false'
+  - id: cfg_i
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: cfg_edit
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: steam_level_val
+    type: int
+    restore_value: false
+    initial_value: '2'
+  - id: coffee_temp_val
+    type: float
+    restore_value: false
+    initial_value: '93.0f'
 
-# --- Haptics: DRV2605 driven directly over I2C -------------------------------
-# The RAR external component is deliberately NOT used. Its setup() reads the
-# status register first; this chip NACKs reads, so setup bails out before
-# configuring LRA mode and library 6, leaving the motor on ERM defaults.
-# Writes work fine, so we drive the six registers ourselves.
+# --- Haptics: DRV2605 driven directly over I2C ---
+# The RAR external component is deliberately not used: its setup() reads a
+# status register this chip NACKs, so it bailed before setting LRA mode and
+# library 6. Writes work fine, so the registers are driven here.
 script:
   - id: haptic_init
     then:
       - lambda: |-
           const uint8_t addr = 0x5A;
-          uint8_t mode_run[2] = {0x01, 0x00};  // MODE: out of standby, internal trigger
-          uint8_t feedback[2] = {0x1A, 0x80};  // FEEDBACK: LRA mode
-          uint8_t library[2]  = {0x03, 0x06};  // LIBRARY: 6 = LRA
+          uint8_t mode_run[2] = {0x01, 0x00};
+          uint8_t feedback[2] = {0x1A, 0x80};
+          uint8_t library[2]  = {0x03, 0x06};
           auto e1 = id(ic_bus)->write(addr, mode_run, 2);
           auto e2 = id(ic_bus)->write(addr, feedback, 2);
           auto e3 = id(ic_bus)->write(addr, library, 2);
@@ -270,13 +348,13 @@ script:
     parameters:
       effect: int
     mode: parallel
-    max_runs: 4
+    max_runs: 6
     then:
       - lambda: |-
           const uint8_t addr = 0x5A;
-          uint8_t w1[2] = {0x04, (uint8_t) effect};  // WAVESEQ1 = effect
-          uint8_t w2[2] = {0x05, 0x00};              // WAVESEQ2 = end
-          uint8_t go[2] = {0x0C, 0x01};              // GO
+          uint8_t w1[2] = {0x04, (uint8_t) effect};
+          uint8_t w2[2] = {0x05, 0x00};
+          uint8_t go[2] = {0x0C, 0x01};
           id(ic_bus)->write(addr, w1, 2);
           id(ic_bus)->write(addr, w2, 2);
           id(ic_bus)->write(addr, go, 2);
@@ -286,10 +364,9 @@ script:
     then:
       - script.execute:
           id: haptic
-          effect: 7          # soft bump
+          effect: 7
       - light.turn_on: back_light
       - script.execute: screentime
-      # Visible proof the knob is alive: flash the ring white.
       - lvgl.widget.update:
           id: ring
           border_color: 0xFFFFFF
@@ -304,7 +381,6 @@ script:
       - delay: $screen_timeout
       - light.turn_off: back_light
 
-  # --- M2: paint the main page from HA state ---
   - id: paint_main
     mode: restart
     then:
@@ -334,8 +410,8 @@ script:
                       border_color: 0xFF8A00
                       border_width: 6
                   - lvgl.label.update:
-                      id: lbl_hint
-                      text_color: 0x5A4020
+                      id: lbl_coffee
+                      text_color: 0xFF8A00
                 else:
                   - lvgl.label.update:
                       id: lbl_state
@@ -346,10 +422,198 @@ script:
                       border_color: 0x242424
                       border_width: 6
                   - lvgl.label.update:
-                      id: lbl_hint
+                      id: lbl_coffee
                       text_color: 0x3A3A3A
+  - id: cfg_move
+    parameters:
+      delta: int
+    mode: parallel
+    max_runs: 8
+    then:
+      - script.execute:
+          id: haptic
+          effect: 7
+      - light.turn_on: back_light
+      - script.execute: screentime
+      - lambda: |-
+          if (id(cfg_edit)) {
+            float t = id(coffee_temp_val) + 0.5f * delta;
+            if (t < 85.0f) t = 85.0f;
+            if (t > 104.0f) t = 104.0f;
+            id(coffee_temp_val) = t;
+          } else {
+            const int n = 5;
+            id(cfg_i) = ((id(cfg_i) + delta) % n + n) % n;
+          }
+      - if:
+          condition:
+            lambda: 'return id(cfg_edit);'
+          then:
+            - script.execute: push_temp
+      - script.execute: paint_cfg
 
-  # --- M4: paint the shot page ---
+  # Debounced: only sends once the knob stops, so a fast spin does not fire
+  # twenty service calls at Home Assistant.
+  - id: push_temp
+    mode: restart
+    then:
+      - delay: 600ms
+      - homeassistant.action:
+          action: number.set_value
+          data:
+            entity_id: $micra_temp
+          data_template:
+            value: "{{ t }}"
+          variables:
+            t: !lambda 'return id(coffee_temp_val);'
+
+  - id: cfg_act
+    mode: restart
+    then:
+      - script.execute:
+          id: haptic
+          effect: 1
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 0;'
+          then:
+            - homeassistant.action:
+                action: switch.toggle
+                data:
+                  entity_id: $micra_steam
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 1;'
+          then:
+            - lambda: |-
+                int lv = id(steam_level_val) + 1;
+                if (lv > 3) lv = 1;
+                id(steam_level_val) = lv;
+            - homeassistant.action:
+                action: select.select_option
+                data:
+                  entity_id: $micra_steam_level
+                data_template:
+                  option: "{{ lv }}"
+                variables:
+                  lv: !lambda 'return id(steam_level_val);'
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 2;'
+          then:
+            - lambda: 'id(cfg_edit) = !id(cfg_edit);'
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 4;'
+          then:
+            - lambda: 'id(cfg_edit) = false;'
+            - lvgl.page.show: page_main
+            - script.execute: paint_main
+      - script.execute: paint_cfg
+
+  - id: paint_cfg
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(cfg_edit);'
+          then:
+            - lvgl.widget.update:
+                id: ring_cfg
+                border_color: 0xFFFFFF
+                border_width: 10
+          else:
+            - lvgl.widget.update:
+                id: ring_cfg
+                border_color: 0xFF8A00
+                border_width: 6
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 0;'
+          then:
+            - lvgl.label.update:
+                id: lbl_cfg_icon
+                text: "\U000F1319"
+            - lvgl.label.update:
+                id: lbl_cfg_name
+                text: "STEAM BOILER"
+            - lvgl.label.update:
+                id: lbl_cfg_value
+                text: !lambda 'return id(steam_on).state ? "ON" : "OFF";'
+            - lvgl.label.update:
+                id: lbl_cfg_hint
+                text: "tap to toggle"
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 1;'
+          then:
+            - lvgl.label.update:
+                id: lbl_cfg_icon
+                text: "\U000F04D3"
+            - lvgl.label.update:
+                id: lbl_cfg_name
+                text: "STEAM LEVEL"
+            - lvgl.label.update:
+                id: lbl_cfg_value
+                text: !lambda |-
+                  static char b[4];
+                  snprintf(b, sizeof(b), "%d", id(steam_level_val));
+                  return b;
+            - lvgl.label.update:
+                id: lbl_cfg_hint
+                text: "tap to cycle 1-3"
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 2;'
+          then:
+            - lvgl.label.update:
+                id: lbl_cfg_icon
+                text: "\U000F050F"
+            - lvgl.label.update:
+                id: lbl_cfg_name
+                text: "COFFEE TEMP"
+            - lvgl.label.update:
+                id: lbl_cfg_value
+                text: !lambda |-
+                  static char b[10];
+                  snprintf(b, sizeof(b), "%.1f", id(coffee_temp_val));
+                  return b;
+            - lvgl.label.update:
+                id: lbl_cfg_hint
+                text: !lambda 'return id(cfg_edit) ? "turn to set, tap to save" : "tap to adjust";'
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 3;'
+          then:
+            - lvgl.label.update:
+                id: lbl_cfg_icon
+                text: "\U000F0AE0"
+            - lvgl.label.update:
+                id: lbl_cfg_name
+                text: "BACKFLUSH"
+            - lvgl.label.update:
+                id: lbl_cfg_value
+                text: "CLEAN"
+            - lvgl.label.update:
+                id: lbl_cfg_hint
+                text: "HOLD to start"
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 4;'
+          then:
+            - lvgl.label.update:
+                id: lbl_cfg_icon
+                text: "\U000F004D"
+            - lvgl.label.update:
+                id: lbl_cfg_name
+                text: "BACK"
+            - lvgl.label.update:
+                id: lbl_cfg_value
+                text: ""
+            - lvgl.label.update:
+                id: lbl_cfg_hint
+                text: "tap to exit"
+
   - id: paint_shot
     mode: restart
     then:
@@ -375,8 +639,7 @@ interval:
             - script.execute: paint_shot
 
 # =============================================================================
-# UI - 360x360 round. Two pages only, per the POC scope.
-# Built-in Montserrat fonts: no compile-time font download.
+# UI - 360x360 round
 # =============================================================================
 lvgl:
   id: my_lvgl
@@ -391,21 +654,10 @@ lvgl:
   # rotation, so LVGL does this in the panel, not on the CPU.
   rotation: 180
   pages:
-    # --- M2 + M3 ---
+    # ---------------- MAIN ----------------
     - id: page_main
       bg_color: 0x000000
-      # M3: deliberate long-press toggles machine power.
-      # NOTE: the knob has no push contact on this board (see schematic),
-      # so the gesture is a long-press on the screen instead.
-      on_long_press:
-        - logger.log: "M3: long press -> toggling machine power"
-        - script.execute:
-            id: haptic
-            effect: 1
-        - homeassistant.action:
-            action: switch.toggle
-            data:
-              entity_id: $micra_power
+      # No hidden gestures here. Everything is a visible, tappable target.
       widgets:
         - obj:
             id: ring
@@ -417,34 +669,144 @@ lvgl:
             border_width: 6
             border_color: 0x242424
             pad_all: 0
-            # CRITICAL: LVGL sets CLICKABLE on obj by default. This one is
-            # full-screen, so leaving it clickable swallows every touch and
-            # the page never sees on_long_press.
+            # LVGL sets CLICKABLE on obj by default; this one is full-screen
+            # so leaving it clickable swallows every touch.
             clickable: false
             scrollable: false
         - label:
-            id: lbl_brand
-            text: "MICRA"
-            text_font: montserrat_20
-            text_color: 0x6E6E6E
+            id: lbl_coffee
+            text: "\U000F0176"
+            text_font: mdi_64
+            text_color: 0x3A3A3A
             align: CENTER
-            y: -96
+            y: -104
         - label:
             id: lbl_state
             text: "..."
             text_font: montserrat_48
             text_color: 0x585858
             align: CENTER
-            y: -4
-        - label:
-            id: lbl_hint
-            text: "hold screen 1s"
-            text_font: montserrat_16
-            text_color: 0x3A3A3A
+            y: -18
+        - button:
+            id: btn_power
             align: CENTER
-            y: 96
+            x: -62
+            y: 86
+            width: 78
+            height: 78
+            radius: 39
+            bg_color: 0x141414
+            border_width: 2
+            border_color: 0x3A3A3A
+            on_short_click:
+              - script.execute:
+                  id: haptic
+                  effect: 1
+              - script.execute: screentime
+              - homeassistant.action:
+                  action: switch.toggle
+                  data:
+                    entity_id: $micra_power
+            widgets:
+              - label:
+                  id: lbl_btn_power
+                  text: "\U000F0425"
+                  text_font: mdi_40
+                  text_color: 0xFF8A00
+                  align: CENTER
+        - button:
+            id: btn_menu
+            align: CENTER
+            x: 62
+            y: 86
+            width: 78
+            height: 78
+            radius: 39
+            bg_color: 0x141414
+            border_width: 2
+            border_color: 0x3A3A3A
+            on_short_click:
+              - script.execute:
+                  id: haptic
+                  effect: 7
+              - script.execute: screentime
+              - lvgl.page.show: page_cfg
+              - script.execute: paint_cfg
+            widgets:
+              - label:
+                  text: "\U000F0493"
+                  text_font: mdi_40
+                  text_color: 0x8A8A8A
+                  align: CENTER
 
-    # --- M4 ---
+    # ---------------- CONTROL ----------------
+    - id: page_cfg
+      bg_color: 0x000000
+      on_short_click:
+        - script.execute: cfg_act
+      on_long_press:
+        - if:
+            condition:
+              lambda: 'return id(cfg_i) == 3;'
+            then:
+              - logger.log: "CFG: starting backflush"
+              - script.execute:
+                  id: haptic
+                  effect: 1
+              - homeassistant.action:
+                  action: button.press
+                  data:
+                    entity_id: $micra_backflush
+            else:
+              - script.execute:
+                  id: haptic
+                  effect: 1
+              - lambda: 'id(cfg_edit) = false;'
+              - lvgl.page.show: page_main
+              - script.execute: paint_main
+      widgets:
+        - obj:
+            id: ring_cfg
+            align: CENTER
+            width: 348
+            height: 348
+            radius: 174
+            bg_opa: TRANSP
+            border_width: 6
+            border_color: 0xFF8A00
+            pad_all: 0
+            clickable: false
+            scrollable: false
+        - label:
+            id: lbl_cfg_icon
+            text: "\U000F1319"
+            text_font: mdi_40
+            text_color: 0xFF8A00
+            align: CENTER
+            y: -96
+        - label:
+            id: lbl_cfg_name
+            text: "STEAM BOILER"
+            text_font: montserrat_16
+            text_color: 0x8A8A8A
+            align: CENTER
+            y: -50
+        - label:
+            id: lbl_cfg_value
+            text: "..."
+            text_font: montserrat_48
+            text_color: 0xFFFFFF
+            align: CENTER
+            y: 8
+        - label:
+            id: lbl_cfg_hint
+            text: "tap to toggle"
+            text_font: montserrat_16
+            text_color: 0x4A4A4A
+            align: CENTER
+            y: 94
+
+    # ---------------- SHOT ----------------
     - id: page_shot
       bg_color: 0x000000
       widgets:
