@@ -221,6 +221,22 @@ sensor:
           else:
             - script.execute: knob_tick
 
+  # --- Mahlkonig Sync: the whole shot record lands as ONE atomic bundle
+  # after the shot ends (verified: all six sensors change within 5ms, and
+  # yield_weight has a single state change per shot - it does NOT stream).
+  - platform: homeassistant
+    id: sync_dose
+    entity_id: sensor.mahlkonig_e64_ws_dose_weight
+    internal: true
+  - platform: homeassistant
+    id: sync_yield
+    entity_id: sensor.mahlkonig_e64_ws_yield_weight
+    internal: true
+  - platform: homeassistant
+    id: sync_time
+    entity_id: sensor.mahlkonig_e64_ws_shot_time
+    internal: true
+
   - platform: homeassistant
     id: coffee_temp
     entity_id: $micra_temp
@@ -244,6 +260,27 @@ text_sensor:
     internal: true
     on_value:
       - script.execute: check_steam
+
+  - platform: homeassistant
+    id: sync_quality
+    entity_id: sensor.mahlkonig_e64_ws_shot_quality
+    internal: true
+
+  # Every grind event carries a fresh UUID, so this is the one trigger that
+  # cannot miss a shot or fire twice for the same one.
+  - platform: homeassistant
+    id: shot_uuid
+    entity_id: sensor.mahlkonig_e64_ws_dose_weight
+    attribute: grind_event_uuid
+    internal: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(uuid_seen);'
+          then:
+            - script.execute: shot_result
+          else:
+            - lambda: 'id(uuid_seen) = true;'
 
   - platform: homeassistant
     id: steam_level_txt
@@ -321,9 +358,15 @@ binary_sensor:
       - script.execute:
           id: haptic
           effect: 1
-      - delay: 5s
-      - lvgl.page.show: page_main
-      - script.execute: paint_main
+      # Sync delivers the shot record a few seconds after extraction ends.
+      # Hold the timer until it lands; shot_result takes over when it does.
+      - delay: 25s
+      - if:
+          condition:
+            lvgl.page.is_showing: page_shot
+          then:
+            - lvgl.page.show: page_main
+            - script.execute: paint_main
 
 globals:
   - id: shot_ds
@@ -381,6 +424,22 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: '0x3A3A3A'
+  - id: uuid_seen
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: have_shot
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: last_ratio
+    type: float
+    restore_value: false
+    initial_value: '0.0f'
+  - id: res_c
+    type: uint32_t
+    restore_value: false
+    initial_value: '0xE31E24'
 
 # --- Haptics: DRV2605 driven directly over I2C ---
 # The RAR external component is deliberately not used: its setup() reads a
@@ -471,6 +530,19 @@ script:
           id: ring
           border_color: !lambda 'return lv_color_hex(id(main_ring_c));'
           border_width: 6
+      - lvgl.label.update:
+          id: lbl_last
+          text: !lambda |-
+            static char b[28];
+            if (!id(have_shot)) { b[0] = 0; return b; }
+            snprintf(b, sizeof(b), "1:%.1f   %.1f s",
+                     id(last_ratio), id(sync_time).state);
+            return b;
+          text_color: !lambda |-
+            uint32_t c = id(have_shot) ? (id(res_c) == 0x35C759 ? 0x4E8C57
+                                                                : 0x8C4E4E)
+                                       : 0x000000;
+            return lv_color_hex(c);
 
   - id: power_press
     mode: restart
@@ -709,6 +781,63 @@ script:
                 id: lbl_cfg_hint
                 text: "tap to exit"
 
+  # Target ratio 1:2 classic. Green inside 1.8-2.2, red outside.
+  - id: shot_result
+    mode: restart
+    then:
+      # the bundle arrives as several messages; let all of them land first
+      - delay: 800ms
+      - lambda: |-
+          float d = id(sync_dose).state;
+          float y = id(sync_yield).state;
+          id(last_ratio) = (d > 0.1f) ? (y / d) : 0.0f;
+          id(have_shot) = (d > 0.1f);
+          float r = id(last_ratio);
+          id(res_c) = (r >= 1.8f && r <= 2.2f) ? 0x35C759 : 0xE31E24;
+      - script.execute: paint_result
+      - script.execute: paint_main
+      - light.turn_on: back_light
+      - script.execute: screentime
+      - lvgl.page.show: page_result
+      - script.execute:
+          id: haptic
+          effect: 1
+      - delay: 15s
+      - if:
+          condition:
+            lvgl.page.is_showing: page_result
+          then:
+            - lvgl.page.show: page_main
+            - script.execute: paint_main
+
+  - id: paint_result
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: lbl_res_ratio
+          text: !lambda |-
+            static char b[16];
+            snprintf(b, sizeof(b), "1 : %.1f", id(last_ratio));
+            return b;
+          text_color: !lambda 'return lv_color_hex(id(res_c));'
+      - lvgl.widget.update:
+          id: ring_result
+          border_color: !lambda 'return lv_color_hex(id(res_c));'
+      - lvgl.label.update:
+          id: lbl_res_gram
+          text: !lambda |-
+            static char b[28];
+            snprintf(b, sizeof(b), "%.1f -> %.1f g",
+                     id(sync_dose).state, id(sync_yield).state);
+            return b;
+      - lvgl.label.update:
+          id: lbl_res_meta
+          text: !lambda |-
+            static char b[32];
+            snprintf(b, sizeof(b), "%.1f s  |  %s",
+                     id(sync_time).state, id(sync_quality).state.c_str());
+            return b;
+
   - id: paint_shot
     mode: restart
     then:
@@ -787,7 +916,14 @@ lvgl:
             text_font: montserrat_48
             text_color: 0x585858
             align: CENTER
-            y: 2
+            y: -6
+        - label:
+            id: lbl_last
+            text: ""
+            text_font: montserrat_16
+            text_color: 0x707070
+            align: CENTER
+            y: 34
         - button:
             id: btn_power
             align: CENTER
@@ -938,6 +1074,52 @@ lvgl:
             text_color: 0x4A6A8A
             align: CENTER
             y: 82
+
+    # ---------------- RESULT (Mahlkonig Sync bundle) ----------------
+    - id: page_result
+      bg_color: 0x000000
+      widgets:
+        - obj:
+            id: ring_result
+            align: CENTER
+            width: 348
+            height: 348
+            radius: 174
+            bg_opa: TRANSP
+            border_width: 6
+            border_color: 0xE31E24
+            pad_all: 0
+            clickable: false
+            scrollable: false
+        - label:
+            id: lbl_res_head
+            text: "SHOT"
+            text_font: montserrat_16
+            text_color: 0x707070
+            text_letter_space: 4
+            align: CENTER
+            y: -96
+        - label:
+            id: lbl_res_ratio
+            text: "1 : 0.0"
+            text_font: montserrat_48
+            text_color: 0xE31E24
+            align: CENTER
+            y: -34
+        - label:
+            id: lbl_res_gram
+            text: "0.0 -> 0.0 g"
+            text_font: montserrat_20
+            text_color: 0xFFFFFF
+            align: CENTER
+            y: 22
+        - label:
+            id: lbl_res_meta
+            text: "0.0 s  |  --"
+            text_font: montserrat_16
+            text_color: 0x8A8A8A
+            align: CENTER
+            y: 66
 
     # ---------------- SHOT ----------------
     - id: page_shot
