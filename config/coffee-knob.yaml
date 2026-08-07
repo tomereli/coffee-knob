@@ -88,9 +88,7 @@ display:
     model: JC3636W518V2
     data_rate: 80MHz
     color_order: rgb
-    # 180 so the top of the UI is the USB-C end - that is how it sits when
-    # plugged in for power.
-    rotation: 180
+    rotation: 0
     cs_pin: 14
     reset_pin: 21
     invert_colors: true
@@ -113,11 +111,11 @@ touchscreen:
     display: main_display
     interrupt_pin: GPIO9
     reset_pin: GPIO10
-    # The touchscreen does NOT inherit display rotation in ESPHome - it only
-    # applies this transform. Both axes mirrored to match rotation: 180.
+    # Leave identity: LVGL rotates touch input itself (rotate_coordinates()),
+    # so mirroring here would double-flip it.
     transform:
-      mirror_x: true
-      mirror_y: true
+      mirror_x: false
+      mirror_y: false
       swap_xy: false
     on_touch:
       - script.execute: screentime
@@ -389,6 +387,9 @@ lvgl:
   color_depth: 16
   buffer_size: 24%
   bg_color: 0x000000
+  # USB-C end is the top when plugged in for power. mipi_spi reports hardware
+  # rotation, so LVGL does this in the panel, not on the CPU.
+  rotation: 180
   pages:
     # --- M2 + M3 ---
     - id: page_main
