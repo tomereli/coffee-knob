@@ -181,7 +181,7 @@ image:
     id: img_lm
     type: RGB565
     transparency: alpha_channel
-    resize: 184x90
+    resize: 124x60
 
 external_components:
   - source:
@@ -772,14 +772,22 @@ lvgl:
             id: img_logo
             src: img_lm
             align: CENTER
-            y: -96
+            y: -104
+        - label:
+            id: lbl_wordmark
+            text: "LA MARZOCCO"
+            text_font: montserrat_16
+            text_color: 0xE31E24
+            text_letter_space: 4
+            align: CENTER
+            y: -58
         - label:
             id: lbl_state
             text: "..."
             text_font: montserrat_48
             text_color: 0x585858
             align: CENTER
-            y: -18
+            y: 2
         - button:
             id: btn_power
             align: CENTER
