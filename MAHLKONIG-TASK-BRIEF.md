@@ -1,109 +1,122 @@
-# Task Brief: get grind data out of the Mahlkönig grinder
+# Build a Home Assistant integration for the Mahlkönig grinder
 
 **For:** Faibel
-**From:** the Coffee Knob POC (Opus) — this is a hand-off, not a request for help on my task
+**From:** the Coffee Knob project (Opus)
 **Owner:** Tomer
 
 ---
 
-## 1. Why this exists
+## 1. What this is
 
-There is a working ESP32-S3 knob display (`coffee-knob`, ESPHome → Home Assistant) that already shows La Marzocco Micra state, toggles the machine, and runs a live shot timer. Machine-side data is solved.
+Tomer owns a Mahlkönig grinder and a Mahlkönig account. The official app already shows him his own grind data. He wants that same data in his own Home Assistant instance instead of only in the app.
 
-**Grinder-side data is not.** To log a shot properly you need dose, grind setting and grind time, and right now the only way to get them is for a human to type them into `input_number` helpers. Tomer has explicitly refused to hand-type shot data — reasonably. So either the grinder gives up its data, or shot logging stays a toy.
+This is ordinary home-automation integration work — the same category as the **La Marzocco** integration already running in this system, and as the hundreds of community Home Assistant integrations for consumer appliances. His hardware, his account, his data, his LAN.
 
-**Your job: find out whether the Mahlkönig grinder can be made to emit per-grind data, and if so, build the path.**
+**Nothing here involves other people's accounts or data.**
 
 ---
 
-## 2. Objective
+## 2. Why it matters
 
-Get, per grind event, as many of these as exist:
+A working ESP32-S3 knob display (`coffee-knob`, ESPHome → Home Assistant) already shows La Marzocco Micra state, controls the machine, and runs a live shot timer. The machine side is solved.
 
-- dose weight (g) — the important one
+The grinder side is not. To log a shot properly you want dose, grind setting and grind time. Today the only way to record those is to type them into `input_number` helpers by hand, which Tomer has ruled out — fairly. So either the grinder can publish its data, or shot logging stays a toy.
+
+---
+
+## 3. Goal
+
+Per grind event, whichever of these actually exist:
+
+- dose weight (g) — the valuable one
 - grind setting / micron value
 - grind duration
 - timestamp
-- grinder model / firmware / serial
+- model / firmware / serial
 
-Landing zone: Home Assistant entities. Local protocol strongly preferred over cloud.
+Landing zone: Home Assistant entities. **A local connection is strongly preferred over a cloud one.**
 
-**A clean, evidenced "this is not possible on this model" is a perfectly acceptable outcome.** Do not fake a result.
+A well-evidenced *"this model does not expose that data"* is a perfectly good result. Don't invent one.
 
 ---
 
-## 3. Prior art — start here, do not rediscover
+## 4. Start here — existing work, don't redo it
 
-| Thing | Why it matters |
+| Resource | Why |
 |---|---|
-| [`kevinschweikert/ha-mahlkoenig`](https://github.com/kevinschweikert/ha-mahlkoenig) | An existing Home Assistant integration for the **Mahlkönig X54**. This is the single highest-value lead. Read the source first and find out what transport it uses (it appears to talk to the grinder over the local network). If Tomer's grinder is an X54 or shares firmware, this may be most of the answer. |
-| [Mahlkönig Home iOS app](https://apps.apple.com/us/app/mahlk%C3%B6nig-home/id1641868454) | The official app. Whatever it can see is, by definition, extractable. |
-| [The Sync System](https://www.mahlkoenig.com/products/the-sync-system) / [Sync Scale](https://www.mahlkoenig.com/products/mahlkonig-sync-scale) | Mahlkönig's connected grinding ecosystem. **The Sync Scale is very likely the actual source of dose weight** — the grinder itself may not weigh anything. Establish early whether dose data can exist at all without this scale. |
-| [Grind-by-Sync quick start (PDF)](https://downloads.mahlkoenig.de/Service/Quick_Start_Guide_Mahlkoenig_Grind_by_Sync_Espresso_Grinder.pdf) | Vendor doc describing the grinder↔scale pairing. Good for understanding the protocol's shape. |
-
-Also relevant as a model to copy: the **La Marzocco** HA integration already working in this system was itself built by reverse-engineering a vendor app. Same class of problem, known-good outcome.
+| [`kevinschweikert/ha-mahlkoenig`](https://github.com/kevinschweikert/ha-mahlkoenig) | An existing open-source Home Assistant integration for the **Mahlkönig X54**. Highest-value lead by far. Read the source and see what transport it uses — it appears to talk to the grinder over the local network. If Tomer's grinder is an X54 or shares firmware, this may already be the answer. |
+| [Mahlkönig Home app](https://apps.apple.com/us/app/mahlk%C3%B6nig-home/id1641868454) | The official app. Whatever it can display is data the account has access to. |
+| [The Sync System](https://www.mahlkoenig.com/products/the-sync-system) / [Sync Scale](https://www.mahlkoenig.com/products/mahlkonig-sync-scale) | Mahlkönig's connected grinding ecosystem, Bluetooth-based. **The Sync Scale is probably the actual source of dose weight** — many grinders don't weigh anything themselves. Settle early whether dose data can exist at all without this scale, because it changes the whole plan. |
+| [Grind-by-Sync quick start (PDF)](https://downloads.mahlkoenig.de/Service/Quick_Start_Guide_Mahlkoenig_Grind_by_Sync_Espresso_Grinder.pdf) | Vendor documentation of the grinder↔scale pairing. Good for understanding how the pieces talk. |
 
 ---
 
-## 4. Approach, cheapest first
+## 5. Routes, in the order worth trying
 
-Do not skip to step 5. Steps 1–4 are hours; step 5–6 are days.
+### Route 0 — Identify the hardware (do this first)
+Exact model, firmware version, and what radios it has. A good share of grinders in this range have no connectivity at all. Establish this before spending time on anything else.
 
-1. **Identify the hardware.** Exact model, firmware version, what radios it has. Half the models in this range have no connectivity at all — establish this before anything else.
-2. **Try the existing integration.** If `ha-mahlkoenig` installs and talks, you may be done.
-3. **Network recon.** Is the grinder on the LAN? mDNS/SSDP browse, ARP scan, then port scan it. Look for HTTP/WebSocket. Many of these devices run a small local web API.
-4. **BLE recon.** Scan with `bleak`/nRF Connect, enumerate GATT services and characteristics, subscribe to notifications and grind a dose. The Sync ecosystem is Bluetooth, so this is where dose weight most likely lives.
-5. **App traffic inspection** — see §5 for the correct method.
-6. **Static analysis.** Pull the Android APK, decompile with `jadx`, grep for endpoints, UUIDs, protocol constants. Often faster than dynamic analysis once you know what you're looking for.
+### Route 1 — Local network or Bluetooth (best outcome)
+Many connected appliances expose a small local HTTP or WebSocket service, or a Bluetooth GATT service, that the app talks to directly when you're on the same network.
+
+- Is the grinder on the LAN? Browse mDNS/SSDP, then look at what ports it answers on.
+- Bluetooth: scan with `bleak` or nRF Connect, list the GATT services and characteristics, subscribe to notifications and grind a dose to see what changes.
+
+If this works you get a clean, offline, dependency-free integration. Best possible result.
+
+### Route 2 — The existing X54 integration
+If the model matches, install it and see what it reports. Possibly the whole job.
+
+### Route 3 — The account API the app already uses
+If the grinder only talks to Mahlkönig's cloud, then the integration reads Tomer's own account through the same API the app uses, with his own credentials — the standard pattern for cloud-connected appliance integrations in Home Assistant.
+
+To learn the API shape, observe the app's own requests on a network Tomer controls (e.g. `mitmproxy` on the Windows PC, phone pointed at it). If the app pins its certificates, this route is closed — note that and move on rather than trying to defeat it; Routes 1 and 4 are better uses of the time anyway.
+
+Keep any cloud polling to roughly what the app itself does. No aggressive request rates.
+
+### Route 4 — Run the official Android app on the Windows PC (Tomer's suggestion)
+Run the Android build of the Mahlkönig app in an emulator (Android Studio's AVD, Waydroid, BlueStacks) on the Windows machine, signed in as Tomer, and bridge what it receives into Home Assistant via MQTT or the HA REST API.
+
+Worth noting honestly: **this is the most brittle option.** It needs a machine powered on permanently, it breaks on app updates, and getting data *out* of a running app is awkward. Treat it as the fallback if Routes 1–3 fail — but it is a legitimate option and Tomer specifically wants it considered.
+
+One correction to save time: **an iPhone app cannot be run on a PC.** The iOS Simulator doesn't run App Store builds. If this route is taken it has to be the Android app.
+
+### Route 5 — Read the app's own code
+Public app packages can be inspected to find the endpoints and identifiers they use. Standard practice when documenting an undocumented consumer API, and often faster than watching traffic once you know what to look for.
 
 ---
 
-## 5. Correcting one assumption before you waste time on it
+## 6. Ground rules
 
-Tomer suggested "simulating my iPhone on the PC". **That is not a viable route** — iOS apps cannot be run on a PC, and the iOS Simulator does not run App Store builds. The two things that actually work:
-
-- **(a) Proxy the real iPhone.** Run `mitmproxy` on the PC, point the iPhone's Wi-Fi proxy at it, install and trust the mitm CA on the phone. Works immediately *unless* the app pins certificates. Check for pinning first — it's a 10-minute test.
-- **(b) Android emulator + the Android build of the app.** Slower to set up, but far more tractable: if the app pins certs, you can bypass it with Frida on an emulator, which you cannot easily do on a stock iPhone.
-
-**(b) is the recommended path if (a) hits pinning.** Ask Tomer whether an Android device or Google account is available before committing.
-
-Note also: if the transport turns out to be **BLE, not HTTP**, proxying is the wrong tool entirely — use BLE sniffing (nRF52840 dongle) or Android's HCI snoop log, which is free and often enough.
-
----
-
-## 6. Scope and constraints
-
-This is **interoperability work on hardware Tomer owns, using his own account** — the same thing every vendor-app-derived Home Assistant integration is built on. Keep it there:
-
-- Tomer's own grinder, own app login, own network. He can give you his app credentials.
-- **Do not** touch other users' accounts or data, and do not attack Mahlkönig's infrastructure — no credential stuffing, no enumeration of other users' devices, no load beyond what the app itself generates.
-- **Do not** commit credentials, tokens or captured session data into any repo or document. Redact them in findings.
-- Prefer a **local** transport. A cloud-polling integration that depends on Mahlkönig's servers is a fragile last resort — say so if that's all that's available.
+- Tomer's own grinder, his own account, his own network. He can supply his app login.
+- Only his own data. Nothing that touches other users' accounts or devices.
+- Keep credentials and tokens out of the repo and out of the findings document — redact them.
+- Prefer local. A cloud-polling integration is a fragile last resort; say so plainly if it's all that's available.
 
 ---
 
 ## 7. Deliverables
 
-1. **Findings document** — what the transport is, what fields are actually available, what is *not* available, and how you proved each claim. Negative results stated as plainly as positive ones.
+1. **Findings document** — the transport, which fields are genuinely available, which are not, and the evidence for each claim. Negative results stated as clearly as positive ones.
 2. **A minimal working proof** — a script that connects and prints one real grind event. This is the acceptance test.
-3. **An integration path** — whichever fits: custom HA component, MQTT bridge, or an ESPHome BLE client (note: the coffee-knob is an ESP32-S3 with BLE already sitting next to the machine, so `esp32_ble_tracker` / `ble_client` on that device is a legitimate option worth considering).
-4. **A blunt verdict** if it can't be done, with the evidence that closes the question.
+3. **An integration path** — custom HA component, MQTT bridge, or an ESPHome BLE client. Note: the coffee-knob is an ESP32-S3 with Bluetooth already sitting next to the machine, so `ble_client` on that device is a genuinely good option if the grinder or scale is Bluetooth.
+4. **A clear verdict** if it can't be done, with the evidence that closes the question.
 
 ---
 
-## 8. Open questions for Tomer — ask before starting
+## 8. Questions for Tomer before starting
 
-1. **Which grinder, exactly?** (Model + rough age. This determines everything.)
-2. Is it currently paired to the Mahlkönig Home app, and does the app show you dose/grind history today? If the app can't see it, neither can we.
+1. **Which grinder, exactly?** Model and rough age. This determines everything.
+2. Is it paired to the Mahlkönig Home app now, and does the app show dose/grind history today? If the app can't see it, nothing downstream can.
 3. Do you own the **Sync Scale**, or any Bluetooth coffee scale (Acaia, Bookoo, Timemore)?
-4. Is there an **Android** phone/tablet available, or is it iPhone only?
-5. Is the grinder on Wi-Fi at all, or Bluetooth only?
+4. Is an **Android** device or emulator available, or iPhone only?
+5. Is the grinder on Wi-Fi, Bluetooth, or neither?
 
 ---
 
-## 9. Where to hand back
+## 9. Where this plugs in
 
-The consumer is the `coffee-knob` ESPHome device and Home Assistant. Existing helpers already created and currently unused:
+The consumer is the `coffee-knob` ESPHome device and Home Assistant. These helpers already exist and are currently filled in by hand:
 
 ```
 input_select.coffee_current_beans
@@ -115,4 +128,4 @@ input_datetime.coffee_roast_date
 input_text.coffee_shot_notes
 ```
 
-If you produce real grinder entities, those `input_number` helpers become redundant for dose and grind setting — which is the entire point of this task.
+Real grinder entities would make the dose and grind-setting helpers unnecessary — which is the entire point of this task.

@@ -159,7 +159,9 @@ font:
     id: mdi_64
     size: 64
     bpp: 4
-    glyphs: ["\U000F0176"]
+    glyphs:
+      - "\U000F04D3"
+      - "\U000F109F"
   - file: *mdi_ttf
     id: mdi_40
     size: 40
@@ -220,6 +222,21 @@ sensor:
       - script.execute: paint_cfg
 
 text_sensor:
+  - platform: homeassistant
+    id: coffee_ready_txt
+    entity_id: sensor.la_minea_micra_coffee_boiler_ready_time
+    internal: true
+    on_value:
+      - script.execute: paint_main
+      - script.execute: check_steam
+
+  - platform: homeassistant
+    id: steam_ready_txt
+    entity_id: sensor.la_minea_micra_steam_boiler_ready_time
+    internal: true
+    on_value:
+      - script.execute: check_steam
+
   - platform: homeassistant
     id: steam_level_txt
     entity_id: $micra_steam_level
@@ -325,6 +342,37 @@ globals:
     type: float
     restore_value: false
     initial_value: '93.0f'
+  # The La Marzocco integration reports optimistically, fails over Bluetooth
+  # and rolls back, so its state bounces for ~3s after any command. Hold our
+  # own intent over that window so the display does not flicker.
+  - id: power_pending
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: power_want
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: steaming
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: main_txt
+    type: std::string
+    restore_value: false
+    initial_value: '"..."'
+  - id: main_txt_c
+    type: uint32_t
+    restore_value: false
+    initial_value: '0x505050'
+  - id: main_ring_c
+    type: uint32_t
+    restore_value: false
+    initial_value: '0x1E1E1E'
+  - id: main_icon_c
+    type: uint32_t
+    restore_value: false
+    initial_value: '0x3A3A3A'
 
 # --- Haptics: DRV2605 driven directly over I2C ---
 # The RAR external component is deliberately not used: its setup() reads a
@@ -384,46 +432,83 @@ script:
   - id: paint_main
     mode: restart
     then:
+      - lambda: |-
+          bool known = id(micra_on).has_state() || id(power_pending);
+          bool on = id(power_pending) ? id(power_want) : id(micra_on).state;
+          auto cv = id(coffee_ready_txt).state;
+          bool heating = !cv.empty() && cv != "unavailable" && cv != "unknown";
+          const char *txt = "OFF";
+          uint32_t ring_c = 0x242424, txt_c = 0x585858, icon_c = 0x3A3A3A;
+          if (!known) {
+            txt = "...";
+            txt_c = 0x505050; ring_c = 0x1E1E1E;
+          } else if (on && heating) {
+            txt = "HEATING";
+            txt_c = 0xFFB74D; ring_c = 0xB35C00; icon_c = 0xB35C00;
+          } else if (on) {
+            txt = "READY";
+            txt_c = 0xFFFFFF; ring_c = 0xFF8A00; icon_c = 0xFF8A00;
+          }
+          id(main_txt) = txt;
+          id(main_txt_c) = txt_c;
+          id(main_ring_c) = ring_c;
+          id(main_icon_c) = icon_c;
+      - lvgl.label.update:
+          id: lbl_state
+          text: !lambda |-
+            std::string s = id(main_txt);
+            return s;
+          text_color: !lambda 'return lv_color_hex(id(main_txt_c));'
+      - lvgl.widget.update:
+          id: ring
+          border_color: !lambda 'return lv_color_hex(id(main_ring_c));'
+          border_width: 6
+      - lvgl.label.update:
+          id: lbl_coffee
+          text_color: !lambda 'return lv_color_hex(id(main_icon_c));'
+
+  - id: power_press
+    mode: restart
+    then:
+      - lambda: |-
+          id(power_want) = !(id(power_pending) ? id(power_want) : id(micra_on).state);
+          id(power_pending) = true;
+      - script.execute: paint_main
+      - homeassistant.action:
+          action: switch.toggle
+          data:
+            entity_id: $micra_power
+      - delay: 6s
+      - lambda: 'id(power_pending) = false;'
+      - script.execute: paint_main
+
+  # The integration exposes no "steaming" sensor. Inferred: the steam boiler
+  # is recovering while the coffee boiler is not, which is what happens when
+  # you pull steam. During warm-up BOTH boilers heat, so that is excluded.
+  - id: check_steam
+    mode: restart
+    then:
+      - lambda: |-
+          auto sv = id(steam_ready_txt).state;
+          auto cv = id(coffee_ready_txt).state;
+          bool s_heat = !sv.empty() && sv != "unavailable" && sv != "unknown";
+          bool c_heat = !cv.empty() && cv != "unavailable" && cv != "unknown";
+          id(steaming) = s_heat && !c_heat && !id(shot_running) && id(micra_on).state;
       - if:
           condition:
-            lambda: 'return !id(micra_on).has_state();'
+            lambda: 'return id(steaming) && !id(shot_running);'
           then:
-            - lvgl.label.update:
-                id: lbl_state
-                text: "..."
-                text_color: 0x505050
-            - lvgl.widget.update:
-                id: ring
-                border_color: 0x1E1E1E
-                border_width: 6
+            - light.turn_on: back_light
+            - script.execute: screentime
+            - lvgl.page.show: page_steam
           else:
             - if:
                 condition:
-                  lambda: 'return id(micra_on).state;'
+                  lvgl.page.is_showing: page_steam
                 then:
-                  - lvgl.label.update:
-                      id: lbl_state
-                      text: "ON"
-                      text_color: 0xFFFFFF
-                  - lvgl.widget.update:
-                      id: ring
-                      border_color: 0xFF8A00
-                      border_width: 6
-                  - lvgl.label.update:
-                      id: lbl_coffee
-                      text_color: 0xFF8A00
-                else:
-                  - lvgl.label.update:
-                      id: lbl_state
-                      text: "OFF"
-                      text_color: 0x585858
-                  - lvgl.widget.update:
-                      id: ring
-                      border_color: 0x242424
-                      border_width: 6
-                  - lvgl.label.update:
-                      id: lbl_coffee
-                      text_color: 0x3A3A3A
+                  - lvgl.page.show: page_main
+                  - script.execute: paint_main
+
   - id: cfg_move
     parameters:
       delta: int
@@ -680,7 +765,7 @@ lvgl:
             scrollable: false
         - label:
             id: lbl_coffee
-            text: "\U000F0176"
+            text: "\U000F109F"
             text_font: mdi_64
             text_color: 0x3A3A3A
             align: CENTER
@@ -708,10 +793,7 @@ lvgl:
                   id: haptic
                   effect: 1
               - script.execute: screentime
-              - homeassistant.action:
-                  action: switch.toggle
-                  data:
-                    entity_id: $micra_power
+              - script.execute: power_press
             widgets:
               - label:
                   id: lbl_btn_power
@@ -810,6 +892,41 @@ lvgl:
             text_color: 0x4A4A4A
             align: CENTER
             y: 94
+
+    # ---------------- STEAM (inferred, see check_steam) ----------------
+    - id: page_steam
+      bg_color: 0x000000
+      widgets:
+        - obj:
+            id: ring_steam
+            align: CENTER
+            width: 348
+            height: 348
+            radius: 174
+            bg_opa: TRANSP
+            border_width: 6
+            border_color: 0x2A6FB0
+            pad_all: 0
+            clickable: false
+            scrollable: false
+        - label:
+            text: "\U000F04D3"
+            text_font: mdi_64
+            text_color: 0x4FA3E3
+            align: CENTER
+            y: -78
+        - label:
+            text: "STEAMING"
+            text_font: montserrat_40
+            text_color: 0xFFFFFF
+            align: CENTER
+            y: 20
+        - label:
+            text: "milk"
+            text_font: montserrat_16
+            text_color: 0x4A6A8A
+            align: CENTER
+            y: 82
 
     # ---------------- SHOT ----------------
     - id: page_shot
