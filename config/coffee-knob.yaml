@@ -232,7 +232,10 @@ sensor:
       - logger.log: "M0 KNOB: CW"
       - lvgl.label.update:
           id: lbl_knob
-          text: !lambda 'return "knob " + std::to_string((int)id(knob).state) + "  CW";'
+          text: !lambda |-
+            static char b[28];
+            snprintf(b, sizeof(b), "knob %d  CW", (int) id(knob).state);
+            return b;
       - drv2605.play_effect:
           id: haptic_driver
           effect: 7
@@ -240,7 +243,10 @@ sensor:
       - logger.log: "M0 KNOB: CCW"
       - lvgl.label.update:
           id: lbl_knob
-          text: !lambda 'return "knob " + std::to_string((int)id(knob).state) + "  CCW";'
+          text: !lambda |-
+            static char b[28];
+            snprintf(b, sizeof(b), "knob %d  CCW", (int) id(knob).state);
+            return b;
       - drv2605.play_effect:
           id: haptic_driver
           effect: 7
@@ -260,7 +266,10 @@ lvgl:
         - lambda: 'id(touch_count) += 1;'
         - lvgl.label.update:
             id: lbl_touch
-            text: !lambda 'return "touch " + std::to_string(id(touch_count));'
+            text: !lambda |-
+              static char b[24];
+              snprintf(b, sizeof(b), "touch %d", id(touch_count));
+              return b;
         - drv2605.play_effect:
             id: haptic_driver
             effect: 1
