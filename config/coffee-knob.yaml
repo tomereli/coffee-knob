@@ -58,6 +58,9 @@ logger:
 api:
   encryption:
     key: !secret coffee_knob_api_key
+  on_client_connected:
+    - delay: 2s
+    - script.execute: paint_main
 
 ota:
   - platform: esphome
@@ -85,7 +88,9 @@ display:
     model: JC3636W518V2
     data_rate: 80MHz
     color_order: rgb
-    rotation: 0
+    # 180 so the top of the UI is the USB-C end - that is how it sits when
+    # plugged in for power.
+    rotation: 180
     cs_pin: 14
     reset_pin: 21
     invert_colors: true
@@ -108,9 +113,11 @@ touchscreen:
     display: main_display
     interrupt_pin: GPIO9
     reset_pin: GPIO10
+    # The touchscreen does NOT inherit display rotation in ESPHome - it only
+    # applies this transform. Both axes mirrored to match rotation: 180.
     transform:
-      mirror_x: false
-      mirror_y: false
+      mirror_x: true
+      mirror_y: true
       swap_xy: false
     on_touch:
       - script.execute: screentime
@@ -164,6 +171,11 @@ sensor:
     on_anticlockwise:
       - script.execute: knob_tick
 
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+
 binary_sensor:
   - platform: status
     name: "Connection Status"
@@ -189,16 +201,19 @@ binary_sensor:
   # --- M2: read machine power from Home Assistant ---
   - platform: homeassistant
     id: micra_on
+    name: "Micra Power (mirror)"
+    entity_category: diagnostic
     entity_id: $micra_power
-    internal: true
     on_state:
+      - logger.log: "M2: machine state received from HA"
       - script.execute: paint_main
 
   # --- M4: shot detection ---
   - platform: homeassistant
     id: micra_brewing
+    name: "Micra Brewing (mirror)"
+    entity_category: diagnostic
     entity_id: $micra_brewing
-    internal: true
     on_press:
       - lambda: |-
           id(shot_ds) = 0;
@@ -276,6 +291,13 @@ script:
           effect: 7          # soft bump
       - light.turn_on: back_light
       - script.execute: screentime
+      # Visible proof the knob is alive: flash the ring white.
+      - lvgl.widget.update:
+          id: ring
+          border_color: 0xFFFFFF
+          border_width: 12
+      - delay: 300ms
+      - script.execute: paint_main
 
   - id: screentime
     mode: restart
@@ -299,6 +321,7 @@ script:
             - lvgl.widget.update:
                 id: ring
                 border_color: 0x1E1E1E
+                border_width: 6
           else:
             - if:
                 condition:
@@ -311,6 +334,7 @@ script:
                   - lvgl.widget.update:
                       id: ring
                       border_color: 0xFF8A00
+                      border_width: 6
                   - lvgl.label.update:
                       id: lbl_hint
                       text_color: 0x5A4020
@@ -322,6 +346,7 @@ script:
                   - lvgl.widget.update:
                       id: ring
                       border_color: 0x242424
+                      border_width: 6
                   - lvgl.label.update:
                       id: lbl_hint
                       text_color: 0x3A3A3A
@@ -391,6 +416,11 @@ lvgl:
             border_width: 6
             border_color: 0x242424
             pad_all: 0
+            # CRITICAL: LVGL sets CLICKABLE on obj by default. This one is
+            # full-screen, so leaving it clickable swallows every touch and
+            # the page never sees on_long_press.
+            clickable: false
+            scrollable: false
         - label:
             id: lbl_brand
             text: "MICRA"
@@ -407,7 +437,7 @@ lvgl:
             y: -4
         - label:
             id: lbl_hint
-            text: "hold to toggle"
+            text: "hold screen 1s"
             text_font: montserrat_16
             text_color: 0x3A3A3A
             align: CENTER
