@@ -236,6 +236,12 @@ sensor:
     id: sync_time
     entity_id: sensor.mahlkonig_e64_ws_shot_time
     internal: true
+  # Disc distance in microns. Grind by Sync rewrites this after every shot
+  # from the scale's duration + yield, so the DELTA is the loop working.
+  - platform: homeassistant
+    id: sync_grind
+    entity_id: sensor.mahlkonig_e64_ws_grind_setting
+    internal: true
 
   - platform: homeassistant
     id: coffee_temp
@@ -440,6 +446,18 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: '0xE31E24'
+  - id: prev_grind
+    type: float
+    restore_value: false
+    initial_value: '0.0f'
+  - id: grind_delta
+    type: float
+    restore_value: false
+    initial_value: '0.0f'
+  - id: have_grind
+    type: bool
+    restore_value: false
+    initial_value: 'false'
 
 # --- Haptics: DRV2605 driven directly over I2C ---
 # The RAR external component is deliberately not used: its setup() reads a
@@ -794,6 +812,10 @@ script:
           id(have_shot) = (d > 0.1f);
           float r = id(last_ratio);
           id(res_c) = (r >= 1.8f && r <= 2.2f) ? 0x35C759 : 0xE31E24;
+          float g = id(sync_grind).state;
+          id(grind_delta) = id(have_grind) ? (g - id(prev_grind)) : 0.0f;
+          id(prev_grind) = g;
+          id(have_grind) = true;
       - script.execute: paint_result
       - script.execute: paint_main
       - light.turn_on: back_light
@@ -837,6 +859,18 @@ script:
             snprintf(b, sizeof(b), "%.1f s  |  %s",
                      id(sync_time).state, id(sync_quality).state.c_str());
             return b;
+      - lvgl.label.update:
+          id: lbl_res_grind
+          text: !lambda |-
+            static char b[32];
+            int g = (int) id(sync_grind).state;
+            int d = (int) id(grind_delta);
+            if (d == 0) snprintf(b, sizeof(b), "GRIND %d", g);
+            else snprintf(b, sizeof(b), "GRIND %d   %+d", g, d);
+            return b;
+          text_color: !lambda |-
+            uint32_t c = (id(grind_delta) != 0.0f) ? 0xC8913C : 0x6A6A6A;
+            return lv_color_hex(c);
 
   - id: paint_shot
     mode: restart
@@ -1119,7 +1153,14 @@ lvgl:
             text_font: montserrat_16
             text_color: 0x8A8A8A
             align: CENTER
-            y: 66
+            y: 60
+        - label:
+            id: lbl_res_grind
+            text: ""
+            text_font: montserrat_16
+            text_color: 0x6A6A6A
+            align: CENTER
+            y: 92
 
     # ---------------- SHOT ----------------
     - id: page_shot
