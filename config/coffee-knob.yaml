@@ -539,7 +539,9 @@ script:
                 text: "STEAM BOILER"
             - lvgl.label.update:
                 id: lbl_cfg_value
-                text: !lambda 'return id(steam_on).state ? "ON" : "OFF";'
+                text: !lambda |-
+                  std::string s = id(steam_on).state ? "ON" : "OFF";
+                  return s;
             - lvgl.label.update:
                 id: lbl_cfg_hint
                 text: "tap to toggle"
@@ -580,7 +582,10 @@ script:
                   return b;
             - lvgl.label.update:
                 id: lbl_cfg_hint
-                text: !lambda 'return id(cfg_edit) ? "turn to set, tap to save" : "tap to adjust";'
+                text: !lambda |-
+                  std::string s = id(cfg_edit) ? "turn to set, tap to save"
+                                               : "tap to adjust";
+                  return s;
       - if:
           condition:
             lambda: 'return id(cfg_i) == 3;'
