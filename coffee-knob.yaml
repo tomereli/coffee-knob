@@ -16,6 +16,13 @@
 #   shot:     automatic on brewing_active
 # =============================================================================
 
+# Lets others pull this straight into their ESPHome dashboard (New Device ->
+# import from URL). import_full_config gives them the whole editable file so
+# they can fix up the substitutions below for their own machine.
+dashboard_import:
+  package_import_url: github://tomereli/coffee-knob/coffee-knob.yaml@main
+  import_full_config: true
+
 substitutions:
   micra_power:       switch.la_minea_micra
   micra_brewing:     binary_sensor.la_minea_micra_brewing_active
