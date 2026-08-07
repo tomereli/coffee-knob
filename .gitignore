@@ -1,0 +1,5 @@
+secrets.yaml
+config/.esphome/
+config/.pioenvs/
+config/.piolibdeps/
+upstream/

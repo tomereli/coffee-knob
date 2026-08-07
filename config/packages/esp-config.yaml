@@ -1,0 +1,47 @@
+substitutions:
+# Device setting  
+  board: esp32-s3-devkitc-1
+  name: "esp-smart-knob"
+  friendly_name: "SmartKnob"
+  comment: ESP Smart Knob
+  type: esp-idf  
+  
+esphome:
+  friendly_name: "${friendly_name}"
+  name: "${name}"
+  comment: "${comment}"
+  platformio_options:
+    board_build.flash_mode: dio
+    board_build.f_flash: 80000000L
+    board_build.f_cpu: 240000000L
+    
+esp32:
+  board: ${board}
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+  
+uart:
+  id: audio_uart
+  tx_pin: GPIO41
+  rx_pin: GPIO40
+  baud_rate: 115200
+  rx_buffer_size: 1024
+
+  debug:
+    direction: BOTH            # RX, TX or BOTH
+    dummy_receiver: false
+    after:
+      delimiter: "\n"          # split debug accumulations on newline (adjust to your device)
+    sequence:
+      - lambda: |-
+          UARTDebug::log_string(direction, bytes);
