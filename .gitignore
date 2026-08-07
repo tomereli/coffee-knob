@@ -1,5 +1,19 @@
+# Never commit real credentials
 secrets.yaml
-config/.esphome/
-config/.pioenvs/
-config/.piolibdeps/
+
+# ESPHome build cache and artifacts
+.esphome/
+.pioenvs/
+.piolibdeps/
+*.bin
+
+# Local working copy of the config dir and upstream clones
+config/
 upstream/
+
+# Internal working docs
+MAHLKONIG-TASK-BRIEF.md
+
+# OS junk
+.DS_Store
+Thumbs.db
