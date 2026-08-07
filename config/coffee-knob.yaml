@@ -1,18 +1,24 @@
 # =============================================================================
-# coffee-knob  -  M0: HARDWARE PROOF
+# coffee-knob  -  M1 skeleton + M2 read + M3 write + M4 shot timer
 # Waveshare ESP32-S3-Knob-Touch-LCD-1.8 / Guition JC3636K518C-I-YR1
 #
-# PROVENANCE - every hardware value below is copied verbatim from
-# KrX3D/WaveShare-Knob-Esp32S3 @ 5e22f98. The unmodified upstream files are
-# kept in packages/ for diffing. Sections are tagged [esp-config] /
-# [waveshare] / [drv2605] to show which upstream file they came from.
-# NO PIN NUMBER IN THIS FILE WAS INVENTED.
-#
-# Flattened into one file (rather than !include) because the ESPHome Device
-# Builder add-on stores one YAML document per device.
+# PROVENANCE - hardware values verbatim from KrX3D/WaveShare-Knob-Esp32S3
+# @ 5e22f98, cross-checked against the board schematic. No pin invented.
+#   Display QSPI: CLK 13, D0-3 15/16/17/18, CS 14, RST 21   (ST77916)
+#   Touch  I2C:   SDA 11, SCL 12, INT 9, RST 10             (CST816D @ 0x15)
+#   Haptic I2C:   same bus, DRV2605 @ 0x5A, EN strapped 3V3, TRIG to GND
+#   Knob EC1:     A GPIO8, B GPIO7  (EC2 is on the OTHER MCU - not used)
+#   Backlight:    GPIO47 (PWM)
 # =============================================================================
 
-esphome:                                              # [esp-config]
+substitutions:
+  micra_power:    switch.la_minea_micra
+  micra_brewing:  binary_sensor.la_minea_micra_brewing_active
+  screen_timeout: 5min
+  # Seconds of shot at which the progress ring completes a full turn.
+  shot_full_scale_ds: "400"   # deciseconds -> 40.0 s
+
+esphome:
   name: coffee-knob
   friendly_name: "Coffee Knob"
   comment: "La Marzocco Micra knob"
@@ -20,16 +26,18 @@ esphome:                                              # [esp-config]
     board_build.flash_mode: dio
     board_build.f_flash: 80000000L
     board_build.f_cpu: 240000000L
-  on_boot:                                            # [waveshare]
+  on_boot:
     - priority: -100
       then:
         - delay: 2s
+        - script.execute: haptic_init
         - light.turn_on:
             id: back_light
-            brightness: 50%
+            brightness: 60%
         - script.execute: screentime
+        - script.execute: paint_main
 
-esp32:                                                # [esp-config]
+esp32:
   board: esp32-s3-devkitc-1
   flash_size: 16MB
   cpu_frequency: 240MHz
@@ -40,20 +48,31 @@ esp32:                                                # [esp-config]
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
 
-psram:                                                # [esp-config]
+psram:
   mode: octal
   speed: 80MHz
 
-# UART link to the board's SECOND MCU (plain ESP32 + PCM5100 DAC).
-# Not used by the POC, kept because it is part of the upstream bring-up.
-uart:                                                 # [esp-config]
-  id: audio_uart
-  tx_pin: GPIO41
-  rx_pin: GPIO40
-  baud_rate: 115200
-  rx_buffer_size: 1024
+logger:
+  level: DEBUG
 
-# --- Display: ST77916 over QSPI --------------------------------- [waveshare]
+api:
+  encryption:
+    key: !secret coffee_knob_api_key
+
+ota:
+  - platform: esphome
+    password: !secret coffee_knob_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Coffee Knob Fallback"
+    password: !secret coffee_knob_ap_password
+
+captive_portal:
+
+# --- Display: ST77916 over QSPI ---------------------------------------------
 spi:
   id: display_qspi
   type: quad
@@ -76,7 +95,7 @@ display:
       height: 360
       width: 360
 
-# --- Touch: CST816 ---------------------------------------------- [waveshare]
+# --- Touch: CST816 -----------------------------------------------------------
 i2c:
   sda: 11
   scl: 12
@@ -94,19 +113,9 @@ touchscreen:
       mirror_y: false
       swap_xy: false
     on_touch:
-      - logger.log:
-          format: "M0 TOUCH at (%d, %d)"
-          args: [touch.x, touch.y]
-      - binary_sensor.template.publish:
-          id: touch_input
-          state: ON
       - script.execute: screentime
-    on_release:
-      - binary_sensor.template.publish:
-          id: touch_input
-          state: OFF
 
-# --- Backlight --------------------------------------------------- [waveshare]
+# --- Backlight ---------------------------------------------------------------
 output:
   - platform: ledc
     pin: GPIO47
@@ -123,182 +132,325 @@ light:
     default_transition_length:
       milliseconds: 30
     initial_state:
-      brightness: 50%
+      brightness: 60%
     on_turn_off:
       - lvgl.pause:
-          show_snow: true
+          show_snow: false
     on_turn_on:
       - lvgl.resume:
 
-script:                                               # [waveshare]
-  - id: screentime
-    mode: restart
-    then:
-      - light.turn_on: back_light
-      - delay: 10 min          # upstream default 30s; lengthened so the
-      - light.turn_off: back_light   # screen does not blank mid-M0-test
-  - id: screenoff
-    then:
-      - script.stop: screentime
-      - light.turn_off: back_light
-
-# --- Haptics: DRV2605 + LRA -------------------------------------- [drv2605]
+# --- Knob: EC1 on GPIO8/GPIO7 ------------------------------------------------
+# NOT a quadrature encoder in the PCNT sense - one pulse per detent, direction
+# encoded by which channel fires. Stock rotary_encoder reads zero here.
 external_components:
-  - source: github://RAR/esphome-drv2605
-    components: [drv2605]
-    refresh: 0s
-  # The knob is NOT a quadrature encoder - two switches, one pulse per detent,
-  # direction encoded by WHICH pin pulses. Stock rotary_encoder reads zero.
   - source:
       type: git
       url: https://github.com/KrX3D/WaveShare-Knob-Esp32S3
       ref: 5e22f98908f758e38f6412e021554d90234bb5ff
     components: [rotary_encoder_custom]
 
-drv2605:
-  id: haptic_driver
-  motor_type: LRA
-  library: 6
-  address: 0x5A
-
-# =============================================================================
-# Glue below this line: identity, network, and the M0 test UI.
-# =============================================================================
-
-logger:
-  level: DEBUG
-
-api:
-  encryption:
-    key: !secret coffee_knob_api_key
-
-ota:
-  - platform: esphome
-    password: !secret coffee_knob_ota_password
-
-wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-  ap:
-    ssid: "Coffee Knob Fallback"
-    password: !secret coffee_knob_ap_password
-
-captive_portal:
-
-binary_sensor:
-  - platform: template                                # [waveshare]
-    name: "Touch Button"
-    id: touch_input
-  - platform: status
-    name: "Connection Status"
-
-text_sensor:
-  - platform: wifi_info
-    ip_address:
-      name: "IP Address"
-
-globals:
-  - id: touch_count
-    type: int
-    restore_value: false
-    initial_value: '0'
-
-number:                                               # [drv2605]
-  - platform: template
-    name: "Haptic Intensity"
-    min_value: 0
-    max_value: 255
-    step: 1
-    initial_value: 255
-    optimistic: true
-    entity_category: config
-    set_action:
-      - drv2605.set_realtime_value:
-          id: haptic_driver
-          value: !lambda "return x;"
-
-# --- M0 check 2: knob rotation ---
 sensor:
   - platform: rotary_encoder_custom
     name: "Knob"
     id: knob
     pin_a: GPIO8
     pin_b: GPIO7
-    min_value: -999
-    max_value: 999
+    min_value: -30000
+    max_value: 30000
     publish_initial_value: true
     restore_mode: ALWAYS_ZERO
     on_clockwise:
-      - logger.log: "M0 KNOB: CW"
-      - lvgl.label.update:
-          id: lbl_knob
-          text: !lambda |-
-            static char b[28];
-            snprintf(b, sizeof(b), "knob %d  CW", (int) id(knob).state);
-            return b;
-      - drv2605.play_effect:
-          id: haptic_driver
-          effect: 7
+      - script.execute: knob_tick
     on_anticlockwise:
-      - logger.log: "M0 KNOB: CCW"
-      - lvgl.label.update:
-          id: lbl_knob
-          text: !lambda |-
-            static char b[28];
-            snprintf(b, sizeof(b), "knob %d  CCW", (int) id(knob).state);
-            return b;
-      - drv2605.play_effect:
-          id: haptic_driver
-          effect: 7
+      - script.execute: knob_tick
 
-# --- M0 checks 1 + 3: screen renders, touch produces events ---
-# LVGL built-in Montserrat fonts: no compile-time font download.
+binary_sensor:
+  - platform: status
+    name: "Connection Status"
+
+  # Diagnostic only, no action bound. The schematic shows EC1 as a 4-pin
+  # encoder with no push contact, so the knob should NOT be pressable.
+  # GPIO0 carries the only candidate button line - this settles it.
+  - platform: gpio
+    name: "Knob Button (probe)"
+    id: gpio0_probe
+    entity_category: diagnostic
+    pin:
+      number: GPIO0
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 30ms
+    on_press:
+      - logger.log: "PROBE: GPIO0 went active - there IS a button on this line"
+
+  # --- M2: read machine power from Home Assistant ---
+  - platform: homeassistant
+    id: micra_on
+    entity_id: $micra_power
+    internal: true
+    on_state:
+      - script.execute: paint_main
+
+  # --- M4: shot detection ---
+  - platform: homeassistant
+    id: micra_brewing
+    entity_id: $micra_brewing
+    internal: true
+    on_press:
+      - lambda: |-
+          id(shot_ds) = 0;
+          id(shot_running) = true;
+      - lvgl.arc.update:
+          id: arc_shot
+          value: 0
+      - lvgl.label.update:
+          id: lbl_shot_time
+          text: "0.0"
+      - light.turn_on: back_light
+      - script.execute: screentime
+      - lvgl.page.show: page_shot
+      - script.execute:
+          id: haptic
+          effect: 1
+    on_release:
+      - lambda: 'id(shot_running) = false;'
+      - script.execute:
+          id: haptic
+          effect: 1
+      - delay: 5s
+      - lvgl.page.show: page_main
+      - script.execute: paint_main
+
+globals:
+  - id: shot_ds          # elapsed shot time in deciseconds (0.1 s units)
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: shot_running
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+# --- Haptics: DRV2605 driven directly over I2C -------------------------------
+# The RAR external component is deliberately NOT used. Its setup() reads the
+# status register first; this chip NACKs reads, so setup bails out before
+# configuring LRA mode and library 6, leaving the motor on ERM defaults.
+# Writes work fine, so we drive the six registers ourselves.
+script:
+  - id: haptic_init
+    then:
+      - lambda: |-
+          const uint8_t addr = 0x5A;
+          uint8_t mode_run[2] = {0x01, 0x00};  // MODE: out of standby, internal trigger
+          uint8_t feedback[2] = {0x1A, 0x80};  // FEEDBACK: LRA mode
+          uint8_t library[2]  = {0x03, 0x06};  // LIBRARY: 6 = LRA
+          auto e1 = id(ic_bus)->write(addr, mode_run, 2);
+          auto e2 = id(ic_bus)->write(addr, feedback, 2);
+          auto e3 = id(ic_bus)->write(addr, library, 2);
+          ESP_LOGI("haptic", "DRV2605 init (LRA, lib 6): %d %d %d (0 = OK)",
+                   (int) e1, (int) e2, (int) e3);
+
+  - id: haptic
+    parameters:
+      effect: int
+    mode: parallel
+    max_runs: 4
+    then:
+      - lambda: |-
+          const uint8_t addr = 0x5A;
+          uint8_t w1[2] = {0x04, (uint8_t) effect};  // WAVESEQ1 = effect
+          uint8_t w2[2] = {0x05, 0x00};              // WAVESEQ2 = end
+          uint8_t go[2] = {0x0C, 0x01};              // GO
+          id(ic_bus)->write(addr, w1, 2);
+          id(ic_bus)->write(addr, w2, 2);
+          id(ic_bus)->write(addr, go, 2);
+
+  - id: knob_tick
+    mode: restart
+    then:
+      - script.execute:
+          id: haptic
+          effect: 7          # soft bump
+      - light.turn_on: back_light
+      - script.execute: screentime
+
+  - id: screentime
+    mode: restart
+    then:
+      - light.turn_on: back_light
+      - delay: $screen_timeout
+      - light.turn_off: back_light
+
+  # --- M2: paint the main page from HA state ---
+  - id: paint_main
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(micra_on).has_state();'
+          then:
+            - lvgl.label.update:
+                id: lbl_state
+                text: "..."
+                text_color: 0x505050
+            - lvgl.widget.update:
+                id: ring
+                border_color: 0x1E1E1E
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(micra_on).state;'
+                then:
+                  - lvgl.label.update:
+                      id: lbl_state
+                      text: "ON"
+                      text_color: 0xFFFFFF
+                  - lvgl.widget.update:
+                      id: ring
+                      border_color: 0xFF8A00
+                  - lvgl.label.update:
+                      id: lbl_hint
+                      text_color: 0x5A4020
+                else:
+                  - lvgl.label.update:
+                      id: lbl_state
+                      text: "OFF"
+                      text_color: 0x585858
+                  - lvgl.widget.update:
+                      id: ring
+                      border_color: 0x242424
+                  - lvgl.label.update:
+                      id: lbl_hint
+                      text_color: 0x3A3A3A
+
+  # --- M4: paint the shot page ---
+  - id: paint_shot
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: lbl_shot_time
+          text: !lambda |-
+            static char b[12];
+            snprintf(b, sizeof(b), "%u.%u", (unsigned) (id(shot_ds) / 10),
+                     (unsigned) (id(shot_ds) % 10));
+            return b;
+      - lvgl.arc.update:
+          id: arc_shot
+          value: !lambda 'return (float) id(shot_ds);'
+
+interval:
+  - interval: 100ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(shot_running);'
+          then:
+            - lambda: 'id(shot_ds) += 1;'
+            - script.execute: paint_shot
+
+# =============================================================================
+# UI - 360x360 round. Two pages only, per the POC scope.
+# Built-in Montserrat fonts: no compile-time font download.
+# =============================================================================
 lvgl:
   id: my_lvgl
   displays: [main_display]
-  touchscreens: [my_touchscreen]
+  touchscreens:
+    - touchscreen_id: my_touchscreen
+      long_press_time: 700ms
   color_depth: 16
   buffer_size: 24%
+  bg_color: 0x000000
   pages:
-    - id: m0_page
-      on_click:
-        - logger.log: "M0 LVGL: click"
-        - lambda: 'id(touch_count) += 1;'
-        - lvgl.label.update:
-            id: lbl_touch
-            text: !lambda |-
-              static char b[24];
-              snprintf(b, sizeof(b), "touch %d", id(touch_count));
-              return b;
-        - drv2605.play_effect:
-            id: haptic_driver
+    # --- M2 + M3 ---
+    - id: page_main
+      bg_color: 0x000000
+      # M3: deliberate long-press toggles machine power.
+      # NOTE: the knob has no push contact on this board (see schematic),
+      # so the gesture is a long-press on the screen instead.
+      on_long_press:
+        - logger.log: "M3: long press -> toggling machine power"
+        - script.execute:
+            id: haptic
             effect: 1
+        - homeassistant.action:
+            action: switch.toggle
+            data:
+              entity_id: $micra_power
       widgets:
-        - label:
-            id: lbl_title
-            text: "M0"
-            text_font: montserrat_40
-            text_color: 0x00FF88
+        - obj:
+            id: ring
             align: CENTER
-            y: -70
+            width: 348
+            height: 348
+            radius: 174
+            bg_opa: TRANSP
+            border_width: 6
+            border_color: 0x242424
+            pad_all: 0
         - label:
-            id: lbl_knob
-            text: "knob 0"
-            text_font: montserrat_28
+            id: lbl_brand
+            text: "MICRA"
+            text_font: montserrat_20
+            text_color: 0x6E6E6E
+            align: CENTER
+            y: -96
+        - label:
+            id: lbl_state
+            text: "..."
+            text_font: montserrat_48
+            text_color: 0x585858
+            align: CENTER
+            y: -4
+        - label:
+            id: lbl_hint
+            text: "hold to toggle"
+            text_font: montserrat_16
+            text_color: 0x3A3A3A
+            align: CENTER
+            y: 96
+
+    # --- M4 ---
+    - id: page_shot
+      bg_color: 0x000000
+      widgets:
+        - arc:
+            id: arc_shot
+            align: CENTER
+            width: 344
+            height: 344
+            start_angle: 270
+            end_angle: 268
+            min_value: 0
+            max_value: $shot_full_scale_ds
+            value: 0
+            adjustable: false
+            arc_width: 14
+            arc_color: 0x201408
+            indicator:
+              arc_width: 14
+              arc_color: 0xFF8A00
+        - label:
+            id: lbl_shot_label
+            text: "SHOT"
+            text_font: montserrat_20
+            text_color: 0x8A6030
+            align: CENTER
+            y: -86
+        - label:
+            id: lbl_shot_time
+            text: "0.0"
+            text_font: montserrat_48
             text_color: 0xFFFFFF
             align: CENTER
             y: 0
         - label:
-            id: lbl_touch
-            text: "touch 0"
-            text_font: montserrat_28
-            text_color: 0xFFFFFF
+            id: lbl_shot_unit
+            text: "seconds"
+            text_font: montserrat_16
+            text_color: 0x4A4A4A
             align: CENTER
-            y: 50
-        - label:
-            id: lbl_hint
-            text: "turn + tap"
-            text_font: montserrat_28
-            text_color: 0x888888
-            align: CENTER
-            y: 110
+            y: 86
