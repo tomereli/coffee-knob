@@ -10,13 +10,40 @@ Everything runs through Home Assistant. Nothing depends on a cloud service at ru
 
 ## Screens
 
+Turning the knob walks a carousel of five cards. Three more screens appear on
+their own when the machine does something.
+
 | Screen | When | Shows |
 |---|---|---|
-| **Main** | idle | La Marzocco mark, `OFF` / `HEATING` / `READY`, last shot ratio + time, power and menu buttons |
-| **Control** | tap the gear | steam boiler, steam level, coffee temperature, backflush — knob to move, tap to act |
-| **Shot** | `brewing_active` turns on | live seconds counter and a filling arc round the bezel |
-| **Result** | when the Sync bundle lands | brew ratio, dose → yield, shot time, quality, and the grind-setting correction |
-| **Steaming** | inferred (see below) | steam indicator |
+| **Main** | card 1, idle | La Marzocco mark, `STANDBY` / `HEATING` / `READY`, last shot ratio + time + score, power and menu buttons |
+| **Shot result** | card 2, and automatically when the Sync bundle lands | brew ratio, dose → yield, shot time vs the recipe target, the machine's own verdict, grind correction, and your rating |
+| **Grinder** | card 3 | dose, grind setting, grind time, which beans are in the hopper, days off roast and brew window |
+| **Care** | card 4 | time since the last backflush, total shots, water tank |
+| **Boilers** | card 5 | coffee target temperature, and both boilers' heating / ready state |
+| **Control** | tap the gear | steam boiler · steam level · coffee temp · target ratio · beans · backflush · back — knob to move, tap to act, hold to leave |
+| **Shot timer** | `brewing_active` turns on | live seconds counter and a filling arc round the bezel |
+| **Backflush** | a cycle starts | paddle prompt, then elapsed time and a filling arc |
+
+### Rating a shot, and the log
+
+Hold on the shot-result card to rate it. Two steps, turn to pick, tap to
+advance: **taste** (sour ↔ bitter, the only axis that means something
+mechanical) and then **score** 1–5. Both are written to Home Assistant on the
+last tap only, so abandoning halfway records nothing.
+
+Committing also calls a Home Assistant script that appends one row to a to-do
+list acting as a shot log. The knob pushes the measured dose, yield and grind
+setting across first, because those live in Home Assistant helpers that are
+otherwise typed by hand.
+
+### There is no steaming screen
+
+Earlier versions inferred one from *steam boiler recovering while the coffee
+boiler is not*. The machine publishes no steaming signal, and every version of
+that inference produced false positives — a cold-start warm-up, the steam
+boiler being switched on by itself, a routine top-up reheat. It was removed
+rather than narrowed again. The boilers card shows the measured steam-boiler
+state instead.
 
 ---
 

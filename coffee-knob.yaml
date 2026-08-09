@@ -9,11 +9,33 @@
 #   Knob EC1:     A GPIO8, B GPIO7  (EC2 is on the OTHER MCU - not used)
 #   Backlight:    GPIO47 (PWM)
 #
+# MDI glyphs are stored as literal characters, never as backslash escapes.
+# Escapes do not survive being written through the dashboard API -- the
+# backslash gets doubled in transit and ESPHome then reports a duplicate
+# glyph. Keep this file free of backslashes entirely.
+#
 # INTERACTION MODEL
-#   main:     short tap -> control page       long press -> toggle power
+#   turn:     walk the card carousel, wrapping both ways
+#               MACHINE - SHOT - GRINDER - CARE - BOILERS
+#   main:     tap the buttons               long press -> wake / standby
+#   cards:    short tap -> back to MACHINE
 #   control:  turn -> move / adjust           short tap -> act
 #             long press -> back to main (or START backflush on that item)
-#   shot:     automatic on brewing_active
+#   SHOT card: long press -> rate. Two steps, turn to pick, tap to advance,
+#             tap again to commit, long press to abandon.
+#               1/2 taste  SOUR - SOUR-ISH - BALANCED - BITTER-ISH - BITTER
+#               2/2 score  1 - 5
+#             Committing also writes one row to the Home Assistant shot log.
+#   shot:     while the timer is LIVE, only a HOLD leaves (a stray tap next
+#             to a steam wand must not throw away a shot you are watching).
+#             Once extraction ends a tap is enough. Rotation is blocked only
+#             while live, and the main card keeps saying the grinder record
+#             is still coming.
+#   clean:    shown automatically while a backflush runs. Rotation will not
+#             navigate away from a running cycle, but a HOLD leaves.
+#             There is NO steaming screen -- the machine publishes no such
+#             signal and every attempt to infer one was wrong. The boilers
+#             card carries the real steam-boiler state instead.
 # =============================================================================
 
 # Lets others pull this straight into their ESPHome dashboard (New Device ->
@@ -30,6 +52,10 @@ substitutions:
   micra_steam_level: select.la_minea_micra_steam_level
   micra_temp:        number.la_minea_micra_coffee_target_temperature
   micra_backflush:   button.la_minea_micra_start_backflush
+  micra_cleaning:    binary_sensor.la_minea_micra_backflush_active
+  # Machine-measured: paddle window ~15 s, full cycle ~90 s from the ON edge.
+  clean_arm_ds:      "160"
+  clean_total_ds:    "900"
   screen_timeout:    5min
   shot_full_scale_ds: "400"
 
@@ -162,23 +188,20 @@ light:
 # raw.githubusercontent (github.com/.../raw/... is proxy-blocked) and baked
 # into the firmware, so nothing is fetched at runtime.
 font:
-  - file: &mdi_ttf "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf"
-    id: mdi_64
-    size: 64
-    bpp: 4
-    glyphs: ["\U000F04D3"]
-  - file: *mdi_ttf
+  - file: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf"
     id: mdi_40
     size: 40
     bpp: 4
     glyphs:
-      - "\U000F004D"
-      - "\U000F0425"
-      - "\U000F0493"
-      - "\U000F04D3"
-      - "\U000F050F"
-      - "\U000F0AE0"
-      - "\U000F1319"
+      - "󰁍"
+      - "󰅶"
+      - "󰐥"
+      - "󰒓"
+      - "󰓓"
+      - "󰔏"
+      - "󰗑"
+      - "󰫠"
+      - "󱌙"
 
 image:
   # SVG wrapping the La Marzocco mark. Kept as SVG because the ESPHome add-on
@@ -189,6 +212,15 @@ image:
     type: RGB565
     transparency: alpha_channel
     resize: 124x60
+
+# Needed only to turn the machine's ISO timestamps into "3h ago". HA is
+# already the source of truth for everything else here, so borrow its clock
+# rather than adding SNTP.
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      - script.execute: refresh_ago
 
 external_components:
   - source:
@@ -216,7 +248,9 @@ sensor:
                 id: cfg_move
                 delta: 1
           else:
-            - script.execute: knob_tick
+            - script.execute:
+                id: card_move
+                delta: 1
     on_anticlockwise:
       - if:
           condition:
@@ -226,7 +260,9 @@ sensor:
                 id: cfg_move
                 delta: -1
           else:
-            - script.execute: knob_tick
+            - script.execute:
+                id: card_move
+                delta: -1
 
   # --- Mahlkonig Sync: the whole shot record lands as ONE atomic bundle
   # after the shot ends (verified: all six sensors change within 5ms, and
@@ -251,12 +287,167 @@ sensor:
     internal: true
 
   - platform: homeassistant
+    id: sync_gtime
+    entity_id: sensor.mahlkonig_e64_ws_grind_time
+    internal: true
+
+  # The grinder's own target, so the card can say how far off the dose landed.
+  - platform: homeassistant
+    id: sync_dose_target
+    entity_id: sensor.mahlkonig_e64_ws_dose_target
+    internal: true
+
+  - platform: homeassistant
+    id: rating_now
+    entity_id: input_number.coffee_shot_rating
+    internal: true
+    on_value:
+      - lambda: 'if (!id(rate_mode)) id(rate_val) = (int) x;'
+
+  # Both pickers open on the last value you gave, not on a neutral default.
+  # When you are dialling in, the previous verdict is the better prior.
+  - platform: homeassistant
+    id: taste_now
+    entity_id: input_number.coffee_shot_taste
+    internal: true
+    on_value:
+      - lambda: 'if (!id(rate_mode)) id(taste_val) = (int) x;'
+
+  # --- What counts as a good shot.
+  # RATIO is genuinely Tomer's own number. Confirmed against the raw Sync API
+  # record by the integration session: the recipe holds weightRecipe (dose),
+  # dddRecipe (grind setting) and brewTimeRecipe (brew time). There is NO
+  # ratio field anywhere -- Mahlkonig targets time and dose, and the ratio is
+  # emergent. So nothing upstream has an opinion about 1:1.7 versus 1:2.
+  # Target plus tolerance rather than min/max: one number to nudge when
+  # taste moves, one to widen when you stop caring.
+  - platform: homeassistant
+    id: tgt_ratio
+    entity_id: input_number.coffee_target_ratio
+    internal: true
+    on_value:
+      - lambda: 'if (!id(cfg_edit)) id(ratio_val) = x;'
+      - script.execute: paint_cfg
+      - script.execute: paint_result
+      - script.execute: paint_main
+  - platform: homeassistant
+    id: tgt_ratio_tol
+    entity_id: input_number.coffee_ratio_tolerance
+    internal: true
+    on_value:
+      - script.execute: paint_result
+      - script.execute: paint_main
+  # Integration v0.1.1 exposes the recipe's OWN target brew time
+  # (grind.payload.brewTimeRecipe = 25000 ms). Subscribed speculatively:
+  # while that version is not yet deployed this reads NaN and calc_verdict
+  # falls back to the helper below, so the knob starts using the real recipe
+  # target the moment it appears -- no reflash. Only the CENTRE comes from
+  # Sync; the tolerance stays Tomer's, because Mahlkonig has no opinion about
+  # how close is close enough.
+  - platform: homeassistant
+    id: mk_time_target
+    entity_id: sensor.mahlkonig_e64_ws_brew_time_target
+    internal: true
+    on_value:
+      - script.execute: paint_result
+      - script.execute: paint_main
+  - platform: homeassistant
+    id: tgt_time
+    entity_id: input_number.coffee_target_shot_time
+    internal: true
+    on_value:
+      - script.execute: paint_result
+      - script.execute: paint_main
+  - platform: homeassistant
+    id: tgt_time_tol
+    entity_id: input_number.coffee_shot_time_tolerance
+    internal: true
+    on_value:
+      - script.execute: paint_result
+      - script.execute: paint_main
+
+  # Roast age, computed in HA from the bean's roast date. Numeric so the
+  # card can print it; the window word below turns it into advice.
+  - platform: homeassistant
+    id: roast_d
+    entity_id: sensor.coffee_days_since_roast
+    internal: true
+    on_value:
+      - script.execute: paint_grind
+
+  - platform: homeassistant
+    id: total_shots
+    entity_id: sensor.la_minea_micra_total_coffees_made
+    internal: true
+    on_value:
+      - script.execute: paint_care
+
+  - platform: homeassistant
     id: coffee_temp
     entity_id: $micra_temp
     internal: true
     on_value:
       - lambda: 'if (!id(cfg_edit)) id(coffee_temp_val) = x;'
       - script.execute: paint_cfg
+      - script.execute: paint_boil
+
+  # --- Battery ---
+  # The board does have an MX1.25 li-po socket and a charge-management IC,
+  # and system voltage reaches the MCU on GPIO1 (ADC1_CH0) behind a 2:1
+  # divider. Two independent sources agree on the pin: Waveshare's own
+  # 01_ADC_Test demo reads "ADC1 channel 0", and KrX3D's config for this
+  # exact board uses GPIO1.
+  # HONEST LIMIT: no charge-status line is broken out to any GPIO, so
+  # "charging" is not observable -- it can only be inferred from voltage,
+  # and a charged pack on USB looks identical to no pack at all. With no
+  # battery fitted this simply reads the USB rail and sits there.
+  - platform: adc
+    pin: GPIO1
+    id: batt_v
+    name: "Supply Voltage"
+    entity_category: diagnostic
+    attenuation: 12db
+    update_interval: 10s
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    filters:
+      - multiply: 2.0
+      - median:
+          window_size: 5
+          send_every: 5
+          send_first_at: 2
+    on_value:
+      - component.update: batt_level
+
+  - platform: template
+    id: batt_level
+    name: "Battery"
+    device_class: battery
+    entity_category: diagnostic
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: never
+    lambda: |-
+      float v = id(batt_v).state;
+      if (std::isnan(v) || std::isinf(v)) return NAN;
+      return v;
+    filters:
+      - calibrate_linear:
+          method: exact
+          datapoints:
+            - 3.00 -> 0.0
+            - 3.50 -> 10.0
+            - 3.65 -> 30.0
+            - 3.75 -> 50.0
+            - 3.90 -> 70.0
+            - 4.10 -> 90.0
+            - 4.20 -> 100.0
+      - clamp:
+          min_value: 0
+          max_value: 100
+    on_value:
+      - lambda: 'id(batt_pct) = std::isnan(x) ? -1 : (int) roundf(x);'
+      - script.execute: paint_batt
 
 text_sensor:
   - platform: homeassistant
@@ -265,19 +456,32 @@ text_sensor:
     internal: true
     on_value:
       - script.execute: paint_main
-      - script.execute: check_steam
+      - script.execute: paint_boil
 
   - platform: homeassistant
     id: steam_ready_txt
     entity_id: sensor.la_minea_micra_steam_boiler_ready_time
     internal: true
     on_value:
-      - script.execute: check_steam
+      - script.execute: paint_boil
 
   - platform: homeassistant
     id: sync_quality
     entity_id: sensor.mahlkonig_e64_ws_shot_quality
     internal: true
+
+  # Mahlkonig's OWN verdict on brew time, against its own recipe target --
+  # OK / OFF_BELOW (too fast) / OFF_ABOVE (too slow). Strictly better than
+  # comparing shot_time to a target myself: no tolerance to keep tuned, and
+  # it cannot disagree with the machine because it IS the machine. The local
+  # band survives only as a fallback for when this is not being published.
+  - platform: homeassistant
+    id: mk_time_quality
+    entity_id: sensor.mahlkonig_e64_ws_shot_quality_brew_time
+    internal: true
+    on_value:
+      - script.execute: paint_result
+      - script.execute: paint_main
 
   # Every grind event carries a fresh UUID, so this is the one trigger that
   # cannot miss a shot or fire twice for the same one.
@@ -286,14 +490,128 @@ text_sensor:
     entity_id: sensor.mahlkonig_e64_ws_dose_weight
     attribute: grind_event_uuid
     internal: true
+
+  - platform: homeassistant
+    id: last_clean_txt
+    entity_id: sensor.la_minea_micra_last_cleaning_time
+    internal: true
     on_value:
+      - script.execute: refresh_ago
+
+  - platform: homeassistant
+    id: last_grind_txt
+    entity_id: sensor.mahlkonig_e64_ws_last_grind
+    internal: true
+    on_value:
+      - script.execute: refresh_ago
+      # THIS is the trigger for a finished shot, not grind_event_uuid.
+      # The UUID changes when you GRIND -- minutes before the shot exists --
+      # so firing on it painted the previous shot's yield every time.
+      # Measured 8 Aug: grind 08:14:03, shot 08:16:53-08:17:31, bundle
+      # (dose, yield, time, quality, this timestamp) all landed 08:17:52.
+      #
+      # A NEW SHOT IS A NEW VALUE, not another delivery of the same one.
+      # The old guard was a bare "have I seen anything yet" latch, which is
+      # wrong: Home Assistant re-sends every subscribed state on reconnect,
+      # and reloading an integration recreates its entities (unavailable ->
+      # value). Either fires on_value again with an UNCHANGED timestamp.
+      # Measured 8 Aug: the Sync integration was redeployed, last_grind was
+      # recreated at 11:22:32 still holding the 10:04 record, and the knob
+      # pinned itself on the result card -- shot_result is mode: restart, so
+      # each phantom re-trigger reset its 60 s auto-return and the screen
+      # never left. Compare the value; ignore placeholders.
+      - lambda: |-
+          id(grind_is_new) = false;
+          if (!x.empty() && x != "unavailable" && x != "unknown") {
+            if (!id(uuid_seen)) {
+              // First real value after boot only tells us where we are.
+              id(uuid_seen) = true;
+              id(last_grind_seen) = x;
+            } else if (x != id(last_grind_seen)) {
+              id(last_grind_seen) = x;
+              id(grind_is_new) = true;
+            }
+          }
       - if:
           condition:
-            lambda: 'return id(uuid_seen);'
+            lambda: 'return id(grind_is_new);'
           then:
             - script.execute: shot_result
-          else:
-            - lambda: 'id(uuid_seen) = true;'
+
+  - platform: homeassistant
+    id: window_txt
+    entity_id: sensor.coffee_brew_window
+    internal: true
+    on_value:
+      - script.execute: paint_grind
+
+  # The bean names are HA input_select options and are NOT all renderable
+  # here: one of them is Hebrew, and the LVGL montserrat fonts carry ASCII
+  # only. Rather than draw a row of empty boxes, reduce each name to what
+  # this display can honestly show and say so when nothing is left. Done
+  # once per change into a global, not per paint.
+  - platform: homeassistant
+    id: beans_hop_txt
+    entity_id: input_select.coffee_current_beans
+    internal: true
+    on_value:
+      - lambda: |-
+          // The bean list lives in Home Assistant and may hold any script;
+          // this display draws ASCII and nothing else. Reduce rather than
+          // mangle: non-ASCII bytes collapse to one space, runs of space
+          // collapse to one, and a name with fewer than two Latin letters
+          // left is reported as unprintable instead of drawn as debris.
+          std::string out;
+          int letters = 0;
+          bool gap = false;
+          for (size_t i = 0; i < x.size(); i++) {
+            unsigned char ch = (unsigned char) x[i];
+            if (ch < 32 || ch > 126 || ch == ' ') { gap = true; continue; }
+            if (!out.empty() && gap) out += ' ';
+            gap = false;
+            out += (char) ch;
+            if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) letters++;
+          }
+          if (letters < 2) out = "non-latin name";
+          if (out.size() > 24) {
+            size_t cut = out.rfind(' ', 24);
+            out = out.substr(0, (cut == std::string::npos || cut < 8) ? 24 : cut);
+          }
+          id(beans_hop_ascii) = out;
+      - script.execute: paint_grind
+      - script.execute: paint_cfg
+
+  - platform: homeassistant
+    id: beans_shot_txt
+    entity_id: input_select.coffee_beans_for_this_shot
+    internal: true
+    on_value:
+      - lambda: |-
+          id(beans_override) = !x.empty() && x != "Same as hopper"
+                               && x != "unavailable" && x != "unknown";
+          // The bean list lives in Home Assistant and may hold any script;
+          // this display draws ASCII and nothing else. Reduce rather than
+          // mangle: non-ASCII bytes collapse to one space, runs of space
+          // collapse to one, and a name with fewer than two Latin letters
+          // left is reported as unprintable instead of drawn as debris.
+          std::string out;
+          int letters = 0;
+          bool gap = false;
+          for (size_t i = 0; i < x.size(); i++) {
+            unsigned char ch = (unsigned char) x[i];
+            if (ch < 32 || ch > 126 || ch == ' ') { gap = true; continue; }
+            if (!out.empty() && gap) out += ' ';
+            gap = false;
+            out += (char) ch;
+            if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) letters++;
+          }
+          if (letters < 2) out = "non-latin name";
+          if (out.size() > 24) {
+            size_t cut = out.rfind(' ', 24);
+            out = out.substr(0, (cut == std::string::npos || cut < 8) ? 24 : cut);
+          }
+          id(beans_shot_ascii) = out;
+      - script.execute: paint_shot_beans
 
   - platform: homeassistant
     id: steam_level_txt
@@ -304,6 +622,7 @@ text_sensor:
           int v = atoi(x.c_str());
           if (v >= 1 && v <= 3) id(steam_level_val) = v;
       - script.execute: paint_cfg
+      - script.execute: paint_boil
 
 button:
   - platform: restart
@@ -336,6 +655,7 @@ binary_sensor:
     entity_id: $micra_power
     on_state:
       - script.execute: paint_main
+      - script.execute: paint_boil
 
   - platform: homeassistant
     id: steam_on
@@ -344,6 +664,14 @@ binary_sensor:
     entity_id: $micra_steam
     on_state:
       - script.execute: paint_cfg
+      - script.execute: paint_boil
+
+  - platform: homeassistant
+    id: water_empty
+    entity_id: binary_sensor.la_minea_micra_water_tank_empty
+    internal: true
+    on_state:
+      - script.execute: paint_care
 
   - platform: homeassistant
     id: micra_brewing
@@ -354,12 +682,25 @@ binary_sensor:
       - lambda: |-
           id(shot_ds) = 0;
           id(shot_running) = true;
+          id(waiting_shot) = false;
+          id(wait_ds) = 0;
       - lvgl.arc.update:
           id: arc_shot
           value: 0
       - lvgl.label.update:
           id: lbl_shot_time
           text: "0.0"
+      # Reset the subtitle: it gets repurposed as the waiting indicator once
+      # extraction ends, so a second shot must not start out saying that.
+      - lvgl.label.update:
+          id: lbl_shot_unit
+          text: "seconds"
+          text_color: 0x4A4A4A
+      # A live timer is protected from stray taps; say so.
+      - lvgl.label.update:
+          id: lbl_shot_hint
+          text: "hold to leave"
+      - script.execute: paint_shot_beans
       - light.turn_on: back_light
       - script.execute: screentime
       - lvgl.page.show: page_shot
@@ -368,18 +709,62 @@ binary_sensor:
           effect: 1
     on_release:
       - lambda: 'id(shot_running) = false;'
+      # Extraction is over, so a plain tap is safe again.
+      - lvgl.label.update:
+          id: lbl_shot_hint
+          text: "tap to leave"
       - script.execute:
           id: haptic
           effect: 1
-      # Sync delivers the shot record a few seconds after extraction ends.
-      # Hold the timer until it lands; shot_result takes over when it does.
-      - delay: 25s
+      # Under 10 s that was a flush, not a shot. Measured 8 Aug: flush ran
+      # 5 s (08:15:23-28), the real shot 38 s (08:16:53-08:17:31). A flush
+      # produces no grind record, so nothing downstream needs telling --
+      # just get off the timer without pretending a shot happened.
       - if:
           condition:
-            lvgl.page.is_showing: page_shot
+            lambda: 'return id(shot_ds) < 100;'
           then:
-            - lvgl.page.show: page_main
+            - if:
+                condition:
+                  lvgl.page.is_showing: page_shot
+                then:
+                  - script.execute: go_main
+          else:
+            # MEASURED 8 Aug: the bundle landed 21 s after one shot and 91 s
+            # after the next. The old fixed 60 s hold therefore gave up 32 s
+            # early, and said nothing at all while it waited -- which read as
+            # a frozen screen. The wait is now open-ended and visible:
+            # paint_wait animates it, the 100 ms interval times it out at
+            # 3 min, and shot_result ends it the moment data lands. A tap or
+            # a turn leaves at any point.
+            - lambda: |-
+                id(waiting_shot) = true;
+                id(wait_ds) = 0;
+            - script.execute: paint_wait
             - script.execute: paint_main
+
+  # The machine's own view of the clean cycle. This is authoritative -- the
+  # button press only asks; this sensor says what actually happened.
+  - platform: homeassistant
+    id: micra_cleaning
+    name: "Micra Cleaning (mirror)"
+    entity_category: diagnostic
+    entity_id: $micra_cleaning
+    on_press:
+      - lambda: |-
+          id(clean_ds) = 0;
+          id(clean_running) = true;
+          id(clean_confirmed) = true;
+      - light.turn_on: back_light
+      - script.execute: screentime
+      - script.execute: paint_clean
+      - lvgl.page.show: page_clean
+      - script.execute:
+          id: haptic
+          effect: 1
+    on_release:
+      - lambda: 'id(clean_running) = false;'
+      - script.execute: finish_clean
 
 globals:
   - id: shot_ds
@@ -390,6 +775,19 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'false'
+  # True from the end of a real extraction until the Sync bundle lands.
+  # MEASURED: the bundle is not punctual. 8 Aug 08:17 it arrived 21 s after
+  # the paddle closed; 8 Aug 09:59 it took 91 s. A fixed delay cannot cover
+  # both, so nothing is timed against a guess any more -- the screen says it
+  # is waiting, and shot_result is what ends the wait.
+  - id: waiting_shot
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: wait_ds
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
   - id: cfg_i
     type: int
     restore_value: false
@@ -406,9 +804,17 @@ globals:
     type: float
     restore_value: false
     initial_value: '93.0f'
-  # The La Marzocco integration reports optimistically, fails over Bluetooth
-  # and rolls back, so its state bounces for ~3s after any command. Hold our
-  # own intent over that window so the display does not flicker.
+  # Local editable copy of the target ratio, same pattern as coffee_temp_val:
+  # held while the knob is turning so the display does not fight the
+  # round-trip, pushed to HA once the knob stops.
+  - id: ratio_val
+    type: float
+    restore_value: false
+    initial_value: '1.80f'
+  # The La Marzocco integration reports optimistically and rolls back if the
+  # command fails, so its state bounces for a few seconds after anything we
+  # send. Hold our own intent over that window so the display does not
+  # flicker -- and so a second press reads our intent, not the stale mirror.
   - id: power_pending
     type: bool
     restore_value: false
@@ -417,7 +823,106 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'false'
-  - id: steaming
+  # --- backflush / clean ---
+  # Timeline read off the machine: backflush_active goes ON the moment the
+  # command lands, which starts a 15 s window to move the paddle. Ignore it
+  # and it drops OFF at ~13-15 s. Move the paddle and it stays ON for the
+  # full ~90 s cycle, then drops and last_cleaning_time updates. So elapsed
+  # time on that one sensor tells arming and cleaning apart.
+  - id: clean_ds
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: clean_running
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # False until the machine itself confirms; guards against a lost command.
+  - id: clean_confirmed
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # True only while we are waking the machine before arming a backflush.
+  # MEASURED 8 Aug 20:05: a backflush fired in standby armed at 20:05:09 and
+  # the machine did not report itself awake until 20:05:15 -- six of the
+  # fifteen paddle seconds were spent on a machine that could not pump. That
+  # attempt aborted; the retry with the machine already on ran the full cycle.
+  - id: clean_waking
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # What is actually printable of each bean name, recomputed only when the
+  # HA option changes. See the text_sensor comment for why this exists.
+  - id: beans_hop_ascii
+    type: std::string
+    restore_value: false
+    initial_value: '"--"'
+  - id: beans_shot_ascii
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  # True when THIS shot is not using the hopper beans. The HA log script
+  # resets the override after every logged row, so this self-clears.
+  - id: beans_override
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: batt_pct
+    type: int
+    restore_value: false
+    initial_value: '-1'
+  # Which carousel card is showing. Rotating the knob moves through these;
+  # anything that returns "home" resets to 0 via go_main.
+  #   0 MACHINE   1 SHOT   2 GRINDER   3 CARE   4 BOILERS
+  - id: card_i
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: ago_clean
+    type: std::string
+    restore_value: false
+    initial_value: '"--"'
+  - id: ago_grind
+    type: std::string
+    restore_value: false
+    initial_value: '"--"'
+  # Hours since the last backflush, so the CARE card can colour itself.
+  # -1 = not known yet.
+  - id: clean_age_h
+    type: int
+    restore_value: false
+    initial_value: '-1'
+  - id: when_txt
+    type: std::string
+    restore_value: false
+    initial_value: '"--"'
+  # Rating is the one thing the machine cannot measure, so it is the one
+  # thing worth typing. Rotation is rebound while this is true.
+  - id: rate_mode
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: rate_val
+    type: int
+    restore_value: false
+    initial_value: '3'
+  # Taste is the one axis nothing else in the chain can see. Grind by Sync
+  # closes its own loop on dose and yield -- it is optimising for hitting the
+  # recipe, not for the cup. -2 sour .. 0 balanced .. +2 bitter, matching
+  # input_number.coffee_shot_taste so it charts against grind setting.
+  - id: taste_val
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # 0 = picking taste, 1 = picking score. One tap between them, one write at
+  # the end -- an abandoned rating leaves nothing behind.
+  - id: rate_step
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Whether THIS shot has been rated. Without it the card would show the
+  # previous cup's verdict and imply it belongs to this one.
+  - id: rated_shot
     type: bool
     restore_value: false
     initial_value: 'false'
@@ -441,6 +946,21 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'false'
+  # The last_grind timestamp we have already reacted to. A new SHOT is a new
+  # VALUE, not merely another delivery of the same one -- see the guard on
+  # last_grind_txt for why that distinction cost an afternoon.
+  - id: last_grind_seen
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: grind_is_new
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: time_c
+    type: uint32_t
+    restore_value: false
+    initial_value: '0x8A8A8A'
   - id: have_shot
     type: bool
     restore_value: false
@@ -449,7 +969,16 @@ globals:
     type: float
     restore_value: false
     initial_value: '0.0f'
+  # res_c is the OVERALL verdict: green only when ratio AND time both land in
+  # band, amber when one of them missed, red when both did. ratio_c is the
+  # ratio alone. Keeping them separate is what stops the aggregate verdict
+  # from hiding which half went wrong -- ring shows res_c, the big number
+  # shows ratio_c, and the meta line under it is coloured by time_c.
   - id: res_c
+    type: uint32_t
+    restore_value: false
+    initial_value: '0xE31E24'
+  - id: ratio_c
     type: uint32_t
     restore_value: false
     initial_value: '0xE31E24'
@@ -499,7 +1028,14 @@ script:
           id(ic_bus)->write(addr, w2, 2);
           id(ic_bus)->write(addr, go, 2);
 
-  - id: knob_tick
+  # Rotation used to flash the ring white and do nothing else. It now walks
+  # the carousel: MACHINE - SHOT - GRINDER - CARE - BOILERS, wrapping both
+  # ways. Transient screens (shot timer, clean cycle, steam) own the display
+  # while they are up, so rotation is ignored there rather than yanking you
+  # off a running timer.
+  - id: card_move
+    parameters:
+      delta: int
     mode: restart
     then:
       - script.execute:
@@ -507,11 +1043,378 @@ script:
           effect: 7
       - light.turn_on: back_light
       - script.execute: screentime
-      - lvgl.widget.update:
-          id: ring
-          border_color: 0xFFFFFF
-          border_width: 12
-      - delay: 300ms
+      - if:
+          condition:
+            lambda: 'return id(rate_mode);'
+          then:
+            # Rating owns the knob while it is open, so turning adjusts the
+            # step you are on instead of sliding off the card entirely.
+            - lambda: |-
+                if (id(rate_step) == 0) {
+                  int t = id(taste_val) + delta;
+                  if (t < -2) t = -2;
+                  if (t > 2) t = 2;
+                  id(taste_val) = t;
+                } else {
+                  int r = id(rate_val) + delta;
+                  if (r < 1) r = 1;
+                  if (r > 5) r = 5;
+                  id(rate_val) = r;
+                }
+            - script.execute: paint_result
+          else:
+            # A live timer owns the knob; a finished one does not. Once
+            # extraction ends you can turn straight off the waiting screen,
+            # and the main card keeps saying the record is still coming.
+            - if:
+                condition:
+                  not:
+                    or:
+                      - and:
+                          - lvgl.page.is_showing: page_shot
+                          - lambda: 'return id(shot_running);'
+                      - lvgl.page.is_showing: page_clean
+                then:
+                  - lambda: |-
+                      int n = id(card_i) + delta;
+                      if (n < 0) n = 4;
+                      if (n > 4) n = 0;
+                      id(card_i) = n;
+                  - script.execute: show_card
+
+  # Paint before showing so a card is never visibly stale for a frame.
+  - id: show_card
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(card_i) == 0;'
+          then:
+            - script.execute: paint_main
+            - lvgl.page.show: page_main
+      - if:
+          condition:
+            lambda: 'return id(card_i) == 1;'
+          then:
+            - script.execute: paint_result
+            - lvgl.page.show: page_result
+      - if:
+          condition:
+            lambda: 'return id(card_i) == 2;'
+          then:
+            - script.execute: paint_grind
+            - lvgl.page.show: page_grind
+      - if:
+          condition:
+            lambda: 'return id(card_i) == 3;'
+          then:
+            - script.execute: paint_care
+            - lvgl.page.show: page_care
+      - if:
+          condition:
+            lambda: 'return id(card_i) == 4;'
+          then:
+            - script.execute: paint_boil
+            - lvgl.page.show: page_boil
+
+  # Both the machine and the grinder report ISO-8601 UTC timestamps. Turn
+  # them into "3h ago" once, here, instead of in every label lambda.
+  - id: refresh_ago
+    mode: restart
+    then:
+      - lambda: |-
+          // days-from-civil (Hinnant). Avoids timegm(), which is not
+          // dependable in the ESP-IDF newlib build.
+          auto to_epoch = [](const std::string &s) -> long long {
+            int Y, M, D, h, m, sec;
+            if (sscanf(s.c_str(), "%d-%d-%dT%d:%d:%d",
+                       &Y, &M, &D, &h, &m, &sec) != 6) return 0LL;
+            int y = Y - (M <= 2);
+            int era = (y >= 0 ? y : y - 399) / 400;
+            unsigned yoe = (unsigned) (y - era * 400);
+            unsigned doy = (153u * (unsigned) (M + (M > 2 ? -3 : 9)) + 2u) / 5u
+                           + (unsigned) D - 1u;
+            unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+            long long days = (long long) era * 146097LL + (long long) doe
+                             - 719468LL;
+            return days * 86400LL + h * 3600LL + m * 60LL + sec;
+          };
+          auto fmt = [](long long ago) -> std::string {
+            char b[24];
+            if (ago < 0) ago = 0;
+            if (ago < 60) snprintf(b, sizeof(b), "just now");
+            else if (ago < 3600) snprintf(b, sizeof(b), "%lldm ago", ago / 60);
+            else if (ago < 172800) snprintf(b, sizeof(b), "%lldh ago", ago / 3600);
+            else snprintf(b, sizeof(b), "%lldd ago", ago / 86400);
+            return std::string(b);
+          };
+          auto now = id(ha_time).now();
+          if (!now.is_valid()) return;
+          long long t = (long long) now.timestamp;
+          long long c = to_epoch(id(last_clean_txt).state);
+          long long g = to_epoch(id(last_grind_txt).state);
+          id(ago_clean) = (c > 0) ? fmt(t - c) : std::string("--");
+          id(ago_grind) = (g > 0) ? fmt(t - g) : std::string("--");
+          id(clean_age_h) = (c > 0) ? (int) ((t - c) / 3600LL) : -1;
+          // Wall clock of the last grind, in LOCAL time. "3h ago" is fine
+          // for the care card, but for a shot you want to know it was 08:14.
+          if (g > 0) {
+            auto lt = ESPTime::from_epoch_local((time_t) g);
+            static const char *MON[] = {"Jan", "Feb", "Mar", "Apr", "May",
+                                        "Jun", "Jul", "Aug", "Sep", "Oct",
+                                        "Nov", "Dec"};
+            char w[32];
+            if (lt.year == now.year && lt.day_of_year == now.day_of_year)
+              snprintf(w, sizeof(w), "today  %02d:%02d", lt.hour, lt.minute);
+            else if (lt.year == now.year &&
+                     lt.day_of_year == now.day_of_year - 1)
+              snprintf(w, sizeof(w), "yesterday  %02d:%02d", lt.hour,
+                       lt.minute);
+            else
+              snprintf(w, sizeof(w), "%s %d  %02d:%02d", MON[lt.month - 1],
+                       lt.day_of_month, lt.hour, lt.minute);
+            id(when_txt) = std::string(w);
+          }
+      - script.execute: paint_care
+      - script.execute: paint_grind
+      - script.execute: paint_result
+
+  - id: paint_grind
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: lbl_gr_dose
+          text: !lambda |-
+            static char b[16];
+            snprintf(b, sizeof(b), "%.1f g", id(sync_dose).state);
+            return std::string(b);
+      - lvgl.label.update:
+          id: lbl_gr_setting
+          text: !lambda |-
+            static char b[20];
+            snprintf(b, sizeof(b), "grind %d", (int) id(sync_grind).state);
+            return std::string(b);
+      - lvgl.label.update:
+          id: lbl_gr_meta
+          text: !lambda |-
+            static char b[40];
+            snprintf(b, sizeof(b), "%.1f s  |  %s",
+                     id(sync_gtime).state, id(sync_quality).state.c_str());
+            return std::string(b);
+      - lvgl.label.update:
+          id: lbl_gr_beans
+          text: !lambda 'return id(beans_hop_ascii);'
+      - lvgl.label.update:
+          id: lbl_gr_roast
+          text: !lambda |-
+            static char b[44];
+            float d = id(roast_d).state;
+            auto w = id(window_txt).state;
+            bool have_w = !w.empty() && w != "unavailable" && w != "unknown";
+            if (std::isnan(d)) return std::string(have_w ? w : std::string(""));
+            snprintf(b, sizeof(b), "%dd off roast - %s", (int) d,
+                     have_w ? w.c_str() : "?");
+            return std::string(b);
+          # Same three colours the rest of the UI already uses for good /
+          # marginal / not-yet-known. No new palette for one line.
+          text_color: !lambda |-
+            auto w = id(window_txt).state;
+            if (w == "prime") return lv_color_hex(0x35C759);
+            if (w == "past prime") return lv_color_hex(0xE8A33D);
+            return lv_color_hex(0x8A8A8A);
+      - lvgl.label.update:
+          id: lbl_gr_ago
+          text: !lambda 'return id(ago_grind);'
+
+  - id: paint_care
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: lbl_care_ago
+          text: !lambda 'return id(ago_clean);'
+          # La Marzocco ask for a backflush daily. Past two days, say so.
+          text_color: !lambda |-
+            int h = id(clean_age_h);
+            if (h < 0) return lv_color_hex(0x585858);
+            if (h >= 48) return lv_color_hex(0xE31E24);
+            if (h >= 24) return lv_color_hex(0xE8A33D);
+            return lv_color_hex(0x35C759);
+      - lvgl.label.update:
+          id: lbl_care_shots
+          text: !lambda |-
+            static char b[28];
+            snprintf(b, sizeof(b), "%d shots total", (int) id(total_shots).state);
+            return std::string(b);
+      - lvgl.label.update:
+          id: lbl_care_water
+          text: !lambda |-
+            return std::string(id(water_empty).state ? "TANK EMPTY"
+                                                     : "tank ok");
+          text_color: !lambda |-
+            return lv_color_hex(id(water_empty).state ? 0xE31E24 : 0x6A6A6A);
+
+  - id: paint_boil
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: lbl_bo_temp
+          text: !lambda |-
+            static char b[16];
+            snprintf(b, sizeof(b), "%.1f", id(coffee_temp_val));
+            return std::string(b);
+      - lvgl.label.update:
+          id: lbl_bo_coffee
+          text: !lambda |-
+            auto cv = id(coffee_ready_txt).state;
+            bool heat = !cv.empty() && cv != "unavailable" && cv != "unknown";
+            if (!id(micra_on).state) return std::string("coffee  standby");
+            return std::string(heat ? "coffee  heating" : "coffee  ready");
+          text_color: !lambda |-
+            auto cv = id(coffee_ready_txt).state;
+            bool heat = !cv.empty() && cv != "unavailable" && cv != "unknown";
+            if (!id(micra_on).state) return lv_color_hex(0x585858);
+            return lv_color_hex(heat ? 0xE8A33D : 0x35C759);
+      - lvgl.label.update:
+          id: lbl_bo_steam
+          text: !lambda |-
+            static char b[28];
+            auto sv = id(steam_ready_txt).state;
+            bool heat = !sv.empty() && sv != "unavailable" && sv != "unknown";
+            if (!id(steam_on).state) { snprintf(b, sizeof(b), "steam  off"); }
+            else snprintf(b, sizeof(b), "steam  lv%d  %s", id(steam_level_val),
+                          heat ? "heating" : "ready");
+            return std::string(b);
+          text_color: !lambda |-
+            auto sv = id(steam_ready_txt).state;
+            bool heat = !sv.empty() && sv != "unavailable" && sv != "unknown";
+            if (!id(steam_on).state) return lv_color_hex(0x585858);
+            return lv_color_hex(heat ? 0xE8A33D : 0x35C759);
+
+  # Hold on the shot card to open rating; hold again to abandon it. Always
+  # reopens at step 0 so the sequence is the same every time.
+  - id: rate_hold
+    mode: restart
+    then:
+      - script.execute:
+          id: haptic
+          effect: 1
+      - light.turn_on: back_light
+      - script.execute: screentime
+      - lambda: |-
+          id(rate_mode) = !id(rate_mode);
+          if (id(rate_mode)) id(rate_step) = 0;
+      - script.execute: paint_result
+
+  # Tap advances, then commits. Both values are written together on the last
+  # tap, so abandoning halfway leaves Home Assistant untouched rather than
+  # recording a taste with no score. A stray tap outside rating just goes home.
+  - id: rate_tap
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(rate_mode);'
+          then:
+            - script.execute:
+                id: haptic
+                effect: 1
+            - script.execute: screentime
+            - if:
+                condition:
+                  lambda: 'return id(rate_step) == 0;'
+                then:
+                  - lambda: 'id(rate_step) = 1;'
+                  - script.execute: paint_result
+                else:
+                  - homeassistant.action:
+                      action: input_number.set_value
+                      data:
+                        entity_id: input_number.coffee_shot_taste
+                      data_template:
+                        value: "{{ t }}"
+                      variables:
+                        t: !lambda 'return id(taste_val);'
+                  - homeassistant.action:
+                      action: input_number.set_value
+                      data:
+                        entity_id: input_number.coffee_shot_rating
+                      data_template:
+                        value: "{{ r }}"
+                      variables:
+                        r: !lambda 'return id(rate_val);'
+                  # The knob is the only thing in the chain holding the real
+                  # numbers at this moment. HA's dose/yield/grind helpers are
+                  # manual entry and were still sitting at their minimums, so
+                  # a row logged from them alone would read 12.0 -> 15.0 g
+                  # (1:1.25) for every shot ever pulled. Push what Mahlkonig
+                  # measured, then log. Skipped entirely if no shot record has
+                  # arrived, because writing NaN into an input_number fails.
+                  - if:
+                      condition:
+                        lambda: |-
+                          return !std::isnan(id(sync_dose).state)
+                                 && id(sync_dose).state > 0.1f;
+                      then:
+                        - homeassistant.action:
+                            action: input_number.set_value
+                            data:
+                              entity_id: input_number.coffee_dose
+                            data_template:
+                              value: "{{ v }}"
+                            variables:
+                              v: !lambda 'return id(sync_dose).state;'
+                        - homeassistant.action:
+                            action: input_number.set_value
+                            data:
+                              entity_id: input_number.coffee_yield
+                            data_template:
+                              value: "{{ v }}"
+                            variables:
+                              v: !lambda 'return id(sync_yield).state;'
+                        - homeassistant.action:
+                            action: input_number.set_value
+                            data:
+                              entity_id: input_number.coffee_grind_setting
+                            data_template:
+                              value: "{{ v }}"
+                            variables:
+                              v: !lambda 'return id(sync_grind).state;'
+                  # ORDER MATTERS. Every write above has to land before this
+                  # runs, because the script reads all of them back out of
+                  # Home Assistant to build the row.
+                  - homeassistant.action:
+                      action: script.coffee_log_shot
+                      data_template:
+                        shot_time: "{{ s }}"
+                      variables:
+                        # shot_ds is the knob's own stopwatch and is the
+                        # number he watched count up. It survives until the
+                        # next extraction starts, so it is still this shot's
+                        # at rating time -- unless the device rebooted in
+                        # between, which is what the Mahlkonig fallback is for.
+                        s: !lambda |-
+                          if (id(shot_ds) > 0) return id(shot_ds) / 10.0f;
+                          float t = id(sync_time).state;
+                          return std::isnan(t) ? 0.0f : t;
+                  - lambda: |-
+                      id(rate_mode) = false;
+                      id(rate_step) = 0;
+                      id(rated_shot) = true;
+                  - script.execute: paint_result
+                  - delay: 900ms
+                  - script.execute: go_main
+          else:
+            - script.execute: go_main
+
+  # Single way home, so card_i can never disagree with what is on screen.
+  - id: go_main
+    mode: restart
+    then:
+      - lambda: |-
+          id(card_i) = 0;
+          id(rate_mode) = false;
+          id(rate_step) = 0;
+      - lvgl.page.show: page_main
       - script.execute: paint_main
 
   - id: screentime
@@ -521,15 +1424,61 @@ script:
       - delay: $screen_timeout
       - light.turn_off: back_light
 
+  # ONE place decides whether a shot was good. Every card calls this before
+  # painting, so the main card and the SHOT card cannot disagree about the
+  # same cup no matter which painted last. No delays inside, so it runs
+  # inline like a function call.
+  - id: calc_verdict
+    mode: restart
+    then:
+      - lambda: |-
+          float d = id(sync_dose).state;
+          float y = id(sync_yield).state;
+          id(last_ratio) = (d > 0.1f) ? (y / d) : 0.0f;
+          id(have_shot) = (d > 0.1f);
+          // Fall back to sane espresso numbers if a helper is unavailable,
+          // so a dead cloud never turns the card into nonsense.
+          float tr = id(tgt_ratio).state;
+          float tt = id(tgt_ratio_tol).state;
+          float tv = id(tgt_time_tol).state;
+          if (std::isnan(tr) || tr <= 0.0f) tr = 1.80f;
+          if (std::isnan(tt) || tt <= 0.0f) tt = 0.10f;
+          if (std::isnan(tv) || tv <= 0.0f) tv = 5.0f;
+          // Prefer the recipe's own brew-time target over the local helper:
+          // change the recipe in the Mahlkonig app and the knob follows.
+          float ts = id(mk_time_target).state;
+          if (std::isnan(ts) || ts <= 0.0f) ts = id(tgt_time).state;
+          if (std::isnan(ts) || ts <= 0.0f) ts = 25.0f;
+          float r = id(last_ratio);
+          float st = id(sync_time).state;
+          bool have_time = !std::isnan(st) && st > 0.0f;
+          bool r_ok = (r >= tr - tt && r <= tr + tt);
+          // Time is judged by Mahlkonig when Mahlkonig has an opinion. Only
+          // if it is silent do we fall back to comparing against the target
+          // ourselves -- so the two can never reach opposite conclusions.
+          auto tq = id(mk_time_quality).state;
+          bool have_tq = (tq == "OK" || tq == "OFF_BELOW" || tq == "OFF_ABOVE");
+          bool t_ok = have_tq ? (tq == "OK")
+                    : (have_time && st >= ts - tv && st <= ts + tv);
+          id(ratio_c) = r_ok ? 0x35C759 : 0xE31E24;
+          id(time_c) = !(have_tq || have_time) ? 0x8A8A8A
+                     : (t_ok ? 0x35C759 : 0xE8A33D);
+          id(res_c) = (r_ok && t_ok) ? 0x35C759
+                    : ((r_ok || t_ok) ? 0xE8A33D : 0xE31E24);
+
   - id: paint_main
     mode: restart
     then:
+      - script.execute: calc_verdict
       - lambda: |-
           bool known = id(micra_on).has_state() || id(power_pending);
           bool on = id(power_pending) ? id(power_want) : id(micra_on).state;
           auto cv = id(coffee_ready_txt).state;
           bool heating = !cv.empty() && cv != "unavailable" && cv != "unknown";
-          const char *txt = "OFF";
+          // The Micra has no soft power-off. What the integration calls "off"
+          // is standby: mains still on, boilers cold, gateway still talking.
+          // Say STANDBY so the display matches what the machine is doing.
+          const char *txt = "STANDBY";
           uint32_t ring_c = 0x242424, txt_c = 0x585858, icon_c = 0x3A3A3A;
           if (!known) {
             txt = "...";
@@ -558,16 +1507,35 @@ script:
       - lvgl.label.update:
           id: lbl_last
           text: !lambda |-
-            static char b[28];
+            static char b[32];
+            // While the grinder record is still in flight this line is the
+            // only thing on the main card that can say so -- otherwise
+            // leaving the shot screen looks like the shot was dropped.
+            if (id(waiting_shot)) {
+              snprintf(b, sizeof(b), "waiting for shot data");
+              return b;
+            }
             if (!id(have_shot)) { b[0] = 0; return b; }
-            snprintf(b, sizeof(b), "1:%.1f   %.1f s",
-                     id(last_ratio), id(sync_time).state);
+            // The score joins the line once given, so "was the last one any
+            // good" is answerable from the standby screen without touching
+            // anything. Omitted rather than zeroed when unrated.
+            if (id(rated_shot))
+              snprintf(b, sizeof(b), "1:%.1f   %.1f s   %d/5",
+                       id(last_ratio), id(sync_time).state, id(rate_val));
+            else
+              snprintf(b, sizeof(b), "1:%.1f   %.1f s",
+                       id(last_ratio), id(sync_time).state);
             return b;
+          # Carries the same three-way verdict as the ring, rated or not --
+          # waiting on a rating to call a shot good would leave good shots
+          # looking bad. Brighter than the old 0x4E8C57, which was too muted
+          # to register at a glance from across the kitchen.
           text_color: !lambda |-
-            uint32_t c = id(have_shot) ? (id(res_c) == 0x35C759 ? 0x4E8C57
-                                                                : 0x8C4E4E)
-                                       : 0x000000;
-            return lv_color_hex(c);
+            if (id(waiting_shot)) return lv_color_hex(0xC8913C);
+            if (!id(have_shot)) return lv_color_hex(0x000000);
+            if (id(res_c) == 0x35C759) return lv_color_hex(0x3FBF5A);
+            if (id(res_c) == 0xE8A33D) return lv_color_hex(0xB0823A);
+            return lv_color_hex(0x8C4E4E);
 
   - id: power_press
     mode: restart
@@ -576,40 +1544,225 @@ script:
           id(power_want) = !(id(power_pending) ? id(power_want) : id(micra_on).state);
           id(power_pending) = true;
       - script.execute: paint_main
-      - homeassistant.action:
-          action: switch.toggle
-          data:
-            entity_id: $micra_power
+      # NOT switch.toggle. The cloud round-trip takes seconds, during which
+      # micra_on still reports the old value -- a toggle sent in that window
+      # reads the stale state and undoes the previous press. We already know
+      # what the user asked for, so send it absolutely. Pressing twice now
+      # sends the same command twice instead of cancelling itself.
+      - if:
+          condition:
+            lambda: 'return id(power_want);'
+          then:
+            - homeassistant.action:
+                action: switch.turn_on
+                data:
+                  entity_id: $micra_power
+          else:
+            - homeassistant.action:
+                action: switch.turn_off
+                data:
+                  entity_id: $micra_power
       - delay: 6s
       - lambda: 'id(power_pending) = false;'
       - script.execute: paint_main
 
-  # The integration exposes no "steaming" sensor. Inferred: the steam boiler
-  # is recovering while the coffee boiler is not, which is what happens when
-  # you pull steam. During warm-up BOTH boilers heat, so that is excluded.
-  - id: check_steam
+  # A backflush needs the pump, and the pump needs the machine out of
+  # standby. MEASURED 8 Aug: fired from standby, the paddle window opened at
+  # 20:05:09 and the machine only reported itself awake at 20:05:15 -- that
+  # attempt aborted at 15 s having never been usable. So wake first, arm
+  # second, and say which one is happening.
+  - id: start_clean
     mode: restart
     then:
+      - script.execute:
+          id: haptic
+          effect: 1
+      - light.turn_on: back_light
+      - script.execute: screentime
       - lambda: |-
-          auto sv = id(steam_ready_txt).state;
-          auto cv = id(coffee_ready_txt).state;
-          bool s_heat = !sv.empty() && sv != "unavailable" && sv != "unknown";
-          bool c_heat = !cv.empty() && cv != "unavailable" && cv != "unknown";
-          id(steaming) = s_heat && !c_heat && !id(shot_running) && id(micra_on).state;
+          id(cfg_edit) = false;
+          id(clean_ds) = 0;
+          id(clean_running) = false;
+          id(clean_confirmed) = false;
+          id(clean_waking) = !id(micra_on).state;
+      - script.execute: paint_clean
+      - lvgl.page.show: page_clean
       - if:
           condition:
-            lambda: 'return id(steaming) && !id(shot_running);'
+            lambda: 'return id(clean_waking);'
           then:
-            - light.turn_on: back_light
-            - script.execute: screentime
-            - lvgl.page.show: page_steam
-          else:
-            - if:
+            - homeassistant.action:
+                action: switch.turn_on
+                data:
+                  entity_id: $micra_power
+            - wait_until:
                 condition:
-                  lvgl.page.is_showing: page_steam
-                then:
-                  - lvgl.page.show: page_main
-                  - script.execute: paint_main
+                  lambda: 'return id(micra_on).state;'
+                timeout: 40s
+            # The switch flips a moment before the pump is actually usable.
+            - delay: 4s
+            - lambda: 'id(clean_waking) = false;'
+            - script.execute: paint_clean
+      - if:
+          condition:
+            lambda: 'return !id(micra_on).state;'
+          then:
+            # Never woke. Do not arm a paddle window the machine cannot honour.
+            - lvgl.label.update:
+                id: lbl_clean_head
+                text: "MACHINE ASLEEP"
+                text_color: 0xE8A33D
+            - lvgl.label.update:
+                id: lbl_clean_big
+                text: ""
+            - lvgl.label.update:
+                id: lbl_clean_sub
+                text: "could not wake it - try again"
+            - delay: 6s
+            - script.execute: go_main
+          else:
+            - lambda: |-
+                id(clean_ds) = 0;
+                id(clean_running) = true;
+                id(clean_confirmed) = false;
+            - script.execute: paint_clean
+            - homeassistant.action:
+                action: button.press
+                data:
+                  entity_id: $micra_backflush
+
+  # Two phases on one screen, told apart purely by elapsed time on
+  # micra_cleaning: under ~16 s the machine is still waiting for the paddle,
+  # past that the paddle was moved and the cycle is actually running.
+  - id: paint_batt
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: lbl_batt
+          text: !lambda |-
+            static char b[10];
+            float v = id(batt_v).state;
+            if (std::isnan(v)) return std::string("");
+            // Above ~4.05 V the pack is either full or simply absent, and
+            // what we are reading is the USB rail. Either way it is on
+            // mains, and printing a percentage there would be fiction.
+            if (v >= 4.05f) return std::string("USB");
+            if (id(batt_pct) < 0) return std::string("");
+            snprintf(b, sizeof(b), "%d%%", id(batt_pct));
+            return std::string(b);
+          text_color: !lambda |-
+            float v = id(batt_v).state;
+            if (!std::isnan(v) && v < 4.05f && id(batt_pct) >= 0
+                && id(batt_pct) < 20)
+              return lv_color_hex(0xE8A33D);
+            return lv_color_hex(0x505050);
+
+  # The old version ran a COUNTDOWN through the paddle window: 15, 14, 13...
+  # Reported 8 Aug -- "it was already cleaning and it still showed me 15, 14,
+  # 13, there was no indication it was really cleaning". He was right, and the
+  # countdown was the lie. The machine publishes nothing when the paddle moves
+  # (brewing_active stays OFF through a whole backflush -- checked), so the
+  # only proof we ever get is backflush_active OUTLIVING the arm window. Until
+  # then the honest thing is a number that cannot contradict him: one elapsed
+  # count, monotonic from the first second to the last, with the head line
+  # carrying the phase and the sub line saying plainly what is still unknown.
+  - id: paint_clean
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: lbl_clean_head
+          text: !lambda |-
+            if (id(clean_waking)) return std::string("WAKING MACHINE");
+            return std::string(id(clean_ds) < (uint32_t) $clean_arm_ds
+                               ? "MOVE THE PADDLE" : "CLEANING");
+          text_color: !lambda |-
+            if (id(clean_waking)) return lv_color_hex(0xE8A33D);
+            return lv_color_hex(id(clean_ds) < (uint32_t) $clean_arm_ds
+                                ? 0x4FA3E3 : 0xE31E24);
+      - lvgl.label.update:
+          id: lbl_clean_big
+          text: !lambda |-
+            static char b[12];
+            if (id(clean_waking)) return std::string("");
+            snprintf(b, sizeof(b), "%u", (unsigned) (id(clean_ds) / 10));
+            return std::string(b);
+      - lvgl.label.update:
+          id: lbl_clean_sub
+          text: !lambda |-
+            static char b[40];
+            if (id(clean_waking))
+              return std::string("the pump needs it awake");
+            if (id(clean_ds) >= (uint32_t) $clean_arm_ds)
+              return std::string("seconds elapsed");
+            // Small type, because it is the caveat and not the news: the
+            // machine will not tell us the paddle moved, it will only keep
+            // the cycle alive past this point.
+            int left = ((int) $clean_arm_ds - (int) id(clean_ds) + 9) / 10;
+            if (left < 0) left = 0;
+            snprintf(b, sizeof(b), "move it now - confirms in %2ds", left);
+            return std::string(b);
+      - lvgl.arc.update:
+          id: arc_clean
+          # One continuous fill for the whole cycle. The old arc drained
+          # through the arm window and then refilled, which is two resets on
+          # a screen whose whole job is to say that nothing was lost.
+          value: !lambda |-
+            if (id(clean_waking)) return 0.0f;
+            float f = id(clean_ds) * 100.0f / (float) $clean_total_ds;
+            return f > 100.0f ? 100.0f : f;
+          # The indicator part, not the arc's own -- the arc itself is the
+          # dark unfilled track, so recolouring that would change nothing.
+          indicator:
+            arc_color: !lambda |-
+              if (id(clean_waking)) return lv_color_hex(0xE8A33D);
+              return lv_color_hex(id(clean_ds) < (uint32_t) $clean_arm_ds
+                                  ? 0x2A6FB0 : 0xE31E24);
+
+  - id: finish_clean
+    mode: restart
+    then:
+      - script.execute:
+          id: haptic
+          effect: 1
+      - if:
+          condition:
+            lambda: 'return id(clean_ds) >= (uint32_t) $clean_arm_ds;'
+          then:
+            - lvgl.label.update:
+                id: lbl_clean_head
+                text: "CLEAN DONE"
+                text_color: 0x35C759
+            - lvgl.label.update:
+                id: lbl_clean_sub
+                text: "backflush complete"
+            - lvgl.arc.update:
+                id: arc_clean
+                value: 100
+                indicator:
+                  arc_color: 0x35C759
+          else:
+            - lvgl.label.update:
+                id: lbl_clean_head
+                text: "NOT STARTED"
+                text_color: 0xE8A33D
+            - lvgl.label.update:
+                id: lbl_clean_big
+                text: ""
+            - lvgl.label.update:
+                id: lbl_clean_sub
+                text: "paddle was not moved"
+            - lvgl.arc.update:
+                id: arc_clean
+                value: 0
+                indicator:
+                  arc_color: 0xE8A33D
+      - delay: 5s
+      - lambda: 'id(clean_confirmed) = false;'
+      - if:
+          condition:
+            lvgl.page.is_showing: page_clean
+          then:
+            - script.execute: go_main
 
   - id: cfg_move
     parameters:
@@ -622,21 +1775,64 @@ script:
           effect: 7
       - light.turn_on: back_light
       - script.execute: screentime
+      # cfg_edit alone is no longer enough to say WHAT is being edited, now
+      # that two items are editable. cfg_i cannot change while cfg_edit is
+      # true (turning adjusts the value instead of moving), so the pair is
+      # unambiguous.
       - lambda: |-
-          if (id(cfg_edit)) {
+          if (id(cfg_edit) && id(cfg_i) == 2) {
             float t = id(coffee_temp_val) + 0.5f * delta;
             if (t < 85.0f) t = 85.0f;
             if (t > 104.0f) t = 104.0f;
             id(coffee_temp_val) = t;
+          } else if (id(cfg_edit) && id(cfg_i) == 3) {
+            float r = id(ratio_val) + 0.05f * delta;
+            if (r < 1.20f) r = 1.20f;
+            if (r > 3.00f) r = 3.00f;
+            id(ratio_val) = r;
+          } else if (id(cfg_edit) && id(cfg_i) == 4) {
+            // Beans have no local value to hold: the option list lives in
+            // Home Assistant and the knob never sees it. Home Assistant's
+            // own select_next / select_previous do the walking, fired from
+            // the actions below -- so this branch exists only to stop the
+            // cursor sliding off the item while it is being edited.
           } else {
-            const int n = 5;
+            // SEVEN items now. Renumbering this list means touching four
+            // places: here, cfg_act, paint_cfg, and page_cfg's on_long_press.
+            const int n = 7;
             id(cfg_i) = ((id(cfg_i) + delta) % n + n) % n;
           }
       - if:
           condition:
-            lambda: 'return id(cfg_edit);'
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 2;'
           then:
             - script.execute: push_temp
+      - if:
+          condition:
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 3;'
+          then:
+            - script.execute: push_ratio
+      # No debounce on these two: an input_select has no intermediate values
+      # to spam, each detent is one discrete option, and HA is the only thing
+      # that knows how many there are.
+      - if:
+          condition:
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 4 && delta > 0;'
+          then:
+            - homeassistant.action:
+                action: input_select.select_next
+                data:
+                  entity_id: input_select.coffee_current_beans
+                  cycle: "true"
+      - if:
+          condition:
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 4 && delta < 0;'
+          then:
+            - homeassistant.action:
+                action: input_select.select_previous
+                data:
+                  entity_id: input_select.coffee_current_beans
+                  cycle: "true"
       - script.execute: paint_cfg
 
   # Debounced: only sends once the knob stops, so a fast spin does not fire
@@ -654,6 +1850,20 @@ script:
           variables:
             t: !lambda 'return id(coffee_temp_val);'
 
+  # Same debounce as push_temp: a fast spin should not fire twenty writes.
+  - id: push_ratio
+    mode: restart
+    then:
+      - delay: 600ms
+      - homeassistant.action:
+          action: input_number.set_value
+          data:
+            entity_id: input_number.coffee_target_ratio
+          data_template:
+            value: "{{ r }}"
+          variables:
+            r: !lambda 'return id(ratio_val);'
+
   - id: cfg_act
     mode: restart
     then:
@@ -664,10 +1874,20 @@ script:
           condition:
             lambda: 'return id(cfg_i) == 0;'
           then:
-            - homeassistant.action:
-                action: switch.toggle
-                data:
-                  entity_id: $micra_steam
+            # Absolute, not a toggle -- same staleness trap as power_press.
+            - if:
+                condition:
+                  lambda: 'return !id(steam_on).state;'
+                then:
+                  - homeassistant.action:
+                      action: switch.turn_on
+                      data:
+                        entity_id: $micra_steam
+                else:
+                  - homeassistant.action:
+                      action: switch.turn_off
+                      data:
+                        entity_id: $micra_steam
       - if:
           condition:
             lambda: 'return id(cfg_i) == 1;'
@@ -686,16 +1906,16 @@ script:
                   lv: !lambda 'return id(steam_level_val);'
       - if:
           condition:
-            lambda: 'return id(cfg_i) == 2;'
+            lambda: |-
+              return id(cfg_i) == 2 || id(cfg_i) == 3 || id(cfg_i) == 4;
           then:
             - lambda: 'id(cfg_edit) = !id(cfg_edit);'
       - if:
           condition:
-            lambda: 'return id(cfg_i) == 4;'
+            lambda: 'return id(cfg_i) == 6;'
           then:
             - lambda: 'id(cfg_edit) = false;'
-            - lvgl.page.show: page_main
-            - script.execute: paint_main
+            - script.execute: go_main
       - script.execute: paint_cfg
 
   - id: paint_cfg
@@ -720,12 +1940,13 @@ script:
           then:
             - lvgl.label.update:
                 id: lbl_cfg_icon
-                text: "\U000F1319"
+                text: "󱌙"
             - lvgl.label.update:
                 id: lbl_cfg_name
                 text: "STEAM BOILER"
             - lvgl.label.update:
                 id: lbl_cfg_value
+                text_font: montserrat_48
                 text: !lambda |-
                   std::string s = id(steam_on).state ? "ON" : "OFF";
                   return s;
@@ -738,12 +1959,13 @@ script:
           then:
             - lvgl.label.update:
                 id: lbl_cfg_icon
-                text: "\U000F04D3"
+                text: "󰓓"
             - lvgl.label.update:
                 id: lbl_cfg_name
                 text: "STEAM LEVEL"
             - lvgl.label.update:
                 id: lbl_cfg_value
+                text_font: montserrat_48
                 text: !lambda |-
                   static char b[4];
                   snprintf(b, sizeof(b), "%d", id(steam_level_val));
@@ -757,12 +1979,13 @@ script:
           then:
             - lvgl.label.update:
                 id: lbl_cfg_icon
-                text: "\U000F050F"
+                text: "󰔏"
             - lvgl.label.update:
                 id: lbl_cfg_name
                 text: "COFFEE TEMP"
             - lvgl.label.update:
                 id: lbl_cfg_value
+                text_font: montserrat_48
                 text: !lambda |-
                   static char b[10];
                   snprintf(b, sizeof(b), "%.1f", id(coffee_temp_val));
@@ -773,82 +1996,173 @@ script:
                   std::string s = id(cfg_edit) ? "turn to set, tap to save"
                                                : "tap to adjust";
                   return s;
+      # The one number on this page that is a matter of taste rather than a
+      # machine setting -- and the reason a 1:1.72 shot was showing a red
+      # ring. Editable here so it can be corrected standing at the machine,
+      # right after tasting, which is the only moment you actually know.
       - if:
           condition:
             lambda: 'return id(cfg_i) == 3;'
           then:
             - lvgl.label.update:
                 id: lbl_cfg_icon
-                text: "\U000F0AE0"
+                text: "󰗑"
             - lvgl.label.update:
                 id: lbl_cfg_name
-                text: "BACKFLUSH"
+                text: "TARGET RATIO"
             - lvgl.label.update:
                 id: lbl_cfg_value
-                text: "CLEAN"
+                text_font: montserrat_48
+                text: !lambda |-
+                  static char b[12];
+                  snprintf(b, sizeof(b), "1:%.2f", id(ratio_val));
+                  return b;
             - lvgl.label.update:
                 id: lbl_cfg_hint
-                text: "HOLD to start"
+                text: !lambda |-
+                  std::string s = id(cfg_edit) ? "turn to set, tap to save"
+                                               : "tap to adjust";
+                  return s;
+      # Which beans are in the hopper. The value shown is whatever of the
+      # HA option this display can actually draw -- see beans_hop_ascii.
       - if:
           condition:
             lambda: 'return id(cfg_i) == 4;'
           then:
             - lvgl.label.update:
                 id: lbl_cfg_icon
-                text: "\U000F004D"
+                text: "󰅶"
+            - lvgl.label.update:
+                id: lbl_cfg_name
+                text: "BEANS"
+            - lvgl.label.update:
+                id: lbl_cfg_value
+                text_font: montserrat_20
+                text: !lambda 'return id(beans_hop_ascii);'
+            - lvgl.label.update:
+                id: lbl_cfg_hint
+                text: !lambda |-
+                  std::string s = id(cfg_edit) ? "turn to pick, tap to keep"
+                                               : "tap to change";
+                  return s;
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 5;'
+          then:
+            - lvgl.label.update:
+                id: lbl_cfg_icon
+                text: "󰫠"
+            - lvgl.label.update:
+                id: lbl_cfg_name
+                text: "BACKFLUSH"
+            - lvgl.label.update:
+                id: lbl_cfg_value
+                text_font: montserrat_48
+                text: "CLEAN"
+            - lvgl.label.update:
+                id: lbl_cfg_hint
+                text: "HOLD to start"
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 6;'
+          then:
+            - lvgl.label.update:
+                id: lbl_cfg_icon
+                text: "󰁍"
             - lvgl.label.update:
                 id: lbl_cfg_name
                 text: "BACK"
             - lvgl.label.update:
                 id: lbl_cfg_value
+                text_font: montserrat_48
                 text: ""
             - lvgl.label.update:
                 id: lbl_cfg_hint
                 text: "tap to exit"
 
-  # Target ratio 1:2 classic. Green inside 1.8-2.2, red outside.
+  # Good = the ratio AND the time both inside your own bands. See calc_verdict.
   - id: shot_result
     mode: restart
     then:
+      # Kill the waiting animation on the first message of the bundle, not
+      # after the settle delay -- the point of it is honesty about state.
+      - lambda: 'id(waiting_shot) = false;'
       # the bundle arrives as several messages; let all of them land first
       - delay: 800ms
+      - script.execute: calc_verdict
       - lambda: |-
-          float d = id(sync_dose).state;
-          float y = id(sync_yield).state;
-          id(last_ratio) = (d > 0.1f) ? (y / d) : 0.0f;
-          id(have_shot) = (d > 0.1f);
-          float r = id(last_ratio);
-          id(res_c) = (r >= 1.8f && r <= 2.2f) ? 0x35C759 : 0xE31E24;
           float g = id(sync_grind).state;
           id(grind_delta) = id(have_grind) ? (g - id(prev_grind)) : 0.0f;
           id(prev_grind) = g;
           id(have_grind) = true;
+          // A new shot is unrated by definition. Without this the card would
+          // show the previous cup's verdict as if it were this one's.
+          id(rated_shot) = false;
+          id(rate_step) = 0;
       - script.execute: paint_result
+      - script.execute: paint_grind
       - script.execute: paint_main
       - light.turn_on: back_light
       - script.execute: screentime
-      - lvgl.page.show: page_result
+      # Do not steal the screen from someone who deliberately walked away
+      # from it, and NEVER from a shot that is currently pouring.
+      #
+      # MEASURED 8 Aug, back-to-back shots at 18:46 / 18:49 / 18:51 / 18:53:
+      # the Sync record lands 21-92 s after extraction ends, so at that
+      # cadence the PREVIOUS shot's record routinely arrives in the middle of
+      # the NEXT one. This block then replaced the live timer with the old
+      # shot's result card -- which reads exactly like "it counted and then
+      # it just stopped, while the shot is literally going". The timer was
+      # still running underneath; it had simply been covered up.
+      #
+      # A live extraction outranks everything. Settings and a running clean
+      # cycle keep their existing precedence. card_i is set too, so the
+      # carousel carries on from the SHOT card afterwards.
+      - if:
+          condition:
+            and:
+              - lambda: 'return !id(shot_running);'
+              - not:
+                  or:
+                    - lvgl.page.is_showing: page_cfg
+                    - lvgl.page.is_showing: page_clean
+          then:
+            - lambda: 'id(card_i) = 1;'
+            - lvgl.page.show: page_result
       - script.execute:
           id: haptic
           effect: 1
-      - delay: 15s
+      # Long enough to read it AND rate it. Measured 8 Aug: the rating went
+      # in 86 s after the bundle landed, so the old 30 s had already dumped
+      # him back to main and made him hunt for the card. Never yanks the
+      # card away while you are mid-rating.
+      - delay: 60s
       - if:
           condition:
-            lvgl.page.is_showing: page_result
+            and:
+              - lvgl.page.is_showing: page_result
+              - lambda: 'return !id(rate_mode);'
           then:
-            - lvgl.page.show: page_main
-            - script.execute: paint_main
+            - script.execute: go_main
 
   - id: paint_result
     mode: restart
     then:
+      # Recomputed from live sensors on EVERY paint. shot_result also does
+      # this, but deriving it here as well means the card physically cannot
+      # show a stale ratio, whatever order the bundle arrives in.
+      - script.execute: calc_verdict
+      - lvgl.label.update:
+          id: lbl_res_when
+          text: !lambda 'return id(when_txt);'
       - lvgl.label.update:
           id: lbl_res_ratio
           text: !lambda |-
             static char b[16];
             snprintf(b, sizeof(b), "1 : %.1f", id(last_ratio));
             return b;
-          text_color: !lambda 'return lv_color_hex(id(res_c));'
+          # The number answers for the ratio alone; the ring aggregates.
+          text_color: !lambda 'return lv_color_hex(id(ratio_c));'
       - lvgl.widget.update:
           id: ring_result
           border_color: !lambda 'return lv_color_hex(id(res_c));'
@@ -859,13 +2173,43 @@ script:
             snprintf(b, sizeof(b), "%.1f -> %.1f g",
                      id(sync_dose).state, id(sync_yield).state);
             return b;
+      # The time line, end to end: what the shot took, what the recipe asked
+      # for, how far the dose landed from ITS target, and the machine's own
+      # word on the timing. Verdicts are spelled out rather than left as
+      # OFF_ABOVE, which reads like an error code. Falls back to the overall
+      # shot_quality if the per-axis brew-time verdict is not being published.
       - lvgl.label.update:
           id: lbl_res_meta
           text: !lambda |-
-            static char b[32];
-            snprintf(b, sizeof(b), "%.1f s  |  %s",
-                     id(sync_time).state, id(sync_quality).state.c_str());
-            return b;
+            static char b[56];
+            float d = id(sync_dose).state;
+            float tg = id(sync_dose_target).state;
+            float tt = id(mk_time_target).state;
+            auto tq = id(mk_time_quality).state;
+            auto q = tq.empty() ? id(sync_quality).state : tq;
+            const char *verdict = q == "OFF_BELOW" ? "too fast"
+                                : q == "OFF_ABOVE" ? "too slow"
+                                : q == "OK"        ? "on time" : q.c_str();
+            char head[20];
+            if (std::isnan(tt) || tt <= 0.1f)
+              snprintf(head, sizeof(head), "%.1f s", id(sync_time).state);
+            else
+              snprintf(head, sizeof(head), "%.1f / %.0f s",
+                       id(sync_time).state, tt);
+            if (std::isnan(tg) || tg <= 0.1f)
+              snprintf(b, sizeof(b), "%s   %s", head, verdict);
+            else
+              snprintf(b, sizeof(b), "%s   %+.1f g   %s", head, d - tg,
+                       verdict);
+            return std::string(b);
+          # This line used to be coloured by Mahlkonig's DOSE verdict, which
+          # says nothing you can act on -- Sync manages dose itself, and it
+          # meant the ring could read red while the line read green about the
+          # same shot. It is now coloured by the thing it actually leads with:
+          # whether shot time landed in the window. Ring aggregates, the big
+          # number answers ratio, this answers time. calc_verdict owns the
+          # decision so this line and the ring cannot use different targets.
+          text_color: !lambda 'return lv_color_hex(id(time_c));'
       - lvgl.label.update:
           id: lbl_res_grind
           text: !lambda |-
@@ -878,6 +2222,67 @@ script:
           text_color: !lambda |-
             uint32_t c = (id(grind_delta) != 0.0f) ? 0xC8913C : 0x6A6A6A;
             return lv_color_hex(c);
+      # Two-step rating lives on this one line. Step 0 is the taste axis --
+      # sour and bitter are the only tasting words that mean something
+      # mechanical (under- vs over-extracted), so that is the axis worth a
+      # dedicated step. Step 1 is plain liking, which no measurement implies.
+      - lvgl.label.update:
+          id: lbl_res_rate
+          text: !lambda |-
+            static char b[32];
+            static const char *TP[] = {"SOUR", "SOUR-ISH", "BALANCED",
+                                       "BITTER-ISH", "BITTER"};
+            static const char *TS[] = {"sour", "sour-ish", "balanced",
+                                       "bitter-ish", "bitter"};
+            int i = id(taste_val) + 2;
+            if (i < 0) i = 0;
+            if (i > 4) i = 4;
+            if (id(rate_mode)) {
+              if (id(rate_step) == 0) return std::string(TP[i]);
+              snprintf(b, sizeof(b), "%d / 5", id(rate_val));
+              return std::string(b);
+            }
+            if (id(rated_shot)) {
+              snprintf(b, sizeof(b), "%s   %d / 5", TS[i], id(rate_val));
+              return std::string(b);
+            }
+            return std::string("hold to rate");
+          # Dim grey read as decoration, so the one thing the machine cannot
+          # measure went unrated. Warm it up: it is an invitation, not a note.
+          # While picking taste the word carries its own colour, so the
+          # sour/bitter end you are on is readable without reading.
+          text_color: !lambda |-
+            static const uint32_t TC[] = {0xC8D14A, 0xA8C060, 0x35C759,
+                                          0xC08A50, 0xB0603A};
+            int i = id(taste_val) + 2;
+            if (i < 0) i = 0;
+            if (i > 4) i = 4;
+            if (id(rate_mode))
+              return lv_color_hex(id(rate_step) == 0 ? TC[i] : 0xFFFFFF);
+            if (id(rated_shot)) return lv_color_hex(0x7A7A7A);
+            return lv_color_hex(0x8A7A55);
+      # Only visible while rating: which step you are on, so two taps never
+      # feel like one tap that did the wrong thing.
+      - lvgl.label.update:
+          id: lbl_res_step
+          text: !lambda |-
+            if (!id(rate_mode)) return std::string("");
+            return std::string(id(rate_step) == 0 ? "taste      1 / 2"
+                                                  : "score      2 / 2");
+
+  # Only ever says something when this shot is NOT on the hopper beans, so
+  # its presence alone is the signal. Painted on change and at shot start,
+  # never in the 10 Hz timer loop -- the string cannot move on its own.
+  - id: paint_shot_beans
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: lbl_shot_beans
+          text: !lambda |-
+            if (!id(beans_override)) return std::string("");
+            std::string s = "OTHER: " + id(beans_shot_ascii);
+            if (s.size() > 26) s = s.substr(0, 26);
+            return s;
 
   - id: paint_shot
     mode: restart
@@ -893,6 +2298,43 @@ script:
           id: arc_shot
           value: !lambda 'return (float) id(shot_ds);'
 
+  # The wait for the Sync bundle is the one moment the knob depends on
+  # somebody else's timing, so it says so out loud. The subtitle under the
+  # frozen shot time is repurposed and animated at 2 Hz -- a still screen
+  # reads as a crash, a moving one reads as work in progress. Padded to a
+  # fixed width so the dots do not make the line jitter under centring.
+  - id: paint_wait
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: lbl_shot_unit
+          text: !lambda |-
+            static char b[40];
+            int n = (int) ((id(wait_ds) / 5) % 4);
+            const char *d = n == 1 ? "." : n == 2 ? ".." : n == 3 ? "..." : "";
+            snprintf(b, sizeof(b), "fetching from Mahlkonig%-3s", d);
+            return std::string(b);
+          text_color: 0xC8913C
+
+  # 3 min is well past anything measured (worst so far 91 s). Past that the
+  # record is probably not coming, and saying so beats an animation that
+  # promises data forever.
+  - id: wait_timeout
+    mode: restart
+    then:
+      - lambda: 'id(waiting_shot) = false;'
+      - lvgl.label.update:
+          id: lbl_shot_unit
+          text: "no data from Mahlkonig"
+          text_color: 0x8C4E4E
+      - script.execute: paint_main
+      - delay: 8s
+      - if:
+          condition:
+            lvgl.page.is_showing: page_shot
+          then:
+            - script.execute: go_main
+
 interval:
   - interval: 100ms
     then:
@@ -902,6 +2344,58 @@ interval:
           then:
             - lambda: 'id(shot_ds) += 1;'
             - script.execute: paint_shot
+      - if:
+          condition:
+            lambda: 'return id(waiting_shot);'
+          then:
+            - lambda: 'id(wait_ds) += 1;'
+            # 2 Hz on one short label: enough to read as alive, nowhere near
+            # enough to bother LVGL.
+            - if:
+                condition:
+                  lambda: 'return id(wait_ds) % 5 == 0;'
+                then:
+                  - script.execute: paint_wait
+            - if:
+                condition:
+                  lambda: 'return id(wait_ds) > 1800;'
+                then:
+                  - script.execute: wait_timeout
+      - if:
+          condition:
+            lambda: 'return id(clean_running);'
+          then:
+            - lambda: 'id(clean_ds) += 1;'
+            # 5 Hz is plenty for a seconds readout and leaves LVGL alone.
+            - if:
+                condition:
+                  lambda: 'return id(clean_ds) % 2 == 0;'
+                then:
+                  - script.execute: paint_clean
+            # Outliving the arm window is the ONLY evidence the machine ever
+            # gives that the paddle moved. It is the answer to the question
+            # the user is standing there asking, so make it felt as well as
+            # shown rather than letting the head line change in silence.
+            - if:
+                condition:
+                  lambda: 'return id(clean_ds) == (uint32_t) $clean_arm_ds;'
+                then:
+                  - script.execute:
+                      id: haptic
+                      effect: 1
+                  - script.execute: paint_clean
+            # If the button press never reached the machine, micra_cleaning
+            # never confirms. Do not strand the user on this screen.
+            - if:
+                condition:
+                  lambda: 'return !id(clean_confirmed) && id(clean_ds) > 250;'
+                then:
+                  - lambda: 'id(clean_running) = false;'
+                  - if:
+                      condition:
+                        lvgl.page.is_showing: page_clean
+                      then:
+                        - script.execute: go_main
 
 # =============================================================================
 # UI - 360x360 round
@@ -938,6 +2432,13 @@ lvgl:
             # so leaving it clickable swallows every touch.
             clickable: false
             scrollable: false
+        - label:
+            id: lbl_batt
+            text: ""
+            text_font: montserrat_16
+            text_color: 0x505050
+            align: CENTER
+            y: -150
         - image:
             id: img_logo
             src: img_lm
@@ -985,7 +2486,7 @@ lvgl:
             widgets:
               - label:
                   id: lbl_btn_power
-                  text: "\U000F0425"
+                  text: "󰐥"
                   text_font: mdi_40
                   text_color: 0xE31E24
                   align: CENTER
@@ -1009,7 +2510,7 @@ lvgl:
               - script.execute: paint_cfg
             widgets:
               - label:
-                  text: "\U000F0493"
+                  text: "󰒓"
                   text_font: mdi_40
                   text_color: 0x8A8A8A
                   align: CENTER
@@ -1022,23 +2523,18 @@ lvgl:
       on_long_press:
         - if:
             condition:
-              lambda: 'return id(cfg_i) == 3;'
+              lambda: 'return id(cfg_i) == 5;'
             then:
               - logger.log: "CFG: starting backflush"
-              - script.execute:
-                  id: haptic
-                  effect: 1
-              - homeassistant.action:
-                  action: button.press
-                  data:
-                    entity_id: $micra_backflush
+              # Everything about arming lives in start_clean, including the
+              # wake-from-standby step -- the page should not know the order.
+              - script.execute: start_clean
             else:
               - script.execute:
                   id: haptic
                   effect: 1
               - lambda: 'id(cfg_edit) = false;'
-              - lvgl.page.show: page_main
-              - script.execute: paint_main
+              - script.execute: go_main
       widgets:
         - obj:
             id: ring_cfg
@@ -1054,7 +2550,7 @@ lvgl:
             scrollable: false
         - label:
             id: lbl_cfg_icon
-            text: "\U000F1319"
+            text: "󱌙"
             text_font: mdi_40
             text_color: 0xE31E24
             align: CENTER
@@ -1068,6 +2564,10 @@ lvgl:
             y: -50
         - label:
             id: lbl_cfg_value
+            # Every paint_cfg branch sets text_font explicitly: BEANS needs
+            # small type for a name, everything else is a short value that
+            # earns the big face. Set it on the widget only and the first
+            # visit to BEANS would shrink the rest for the rest of the boot.
             text: "..."
             text_font: montserrat_48
             text_color: 0xFFFFFF
@@ -1081,44 +2581,65 @@ lvgl:
             align: CENTER
             y: 94
 
-    # ---------------- STEAM (inferred, see check_steam) ----------------
-    - id: page_steam
+    # ---------------- CLEAN / BACKFLUSH ----------------
+    # Phase 1: the machine is armed and waiting for the paddle (15 s).
+    # Phase 2: the paddle moved, the cycle is running (~90 s).
+    # Both live here; paint_clean decides which by elapsed time.
+    - id: page_clean
       bg_color: 0x000000
+      # Same safety valve. Hold only -- a stray tap during a live backflush
+      # should not throw the progress arc away. Nothing re-shows this page
+      # once it is left, so leaving is final until the next cycle starts.
+      on_long_press:
+        - script.execute: go_main
       widgets:
-        - obj:
-            id: ring_steam
+        - arc:
+            id: arc_clean
             align: CENTER
-            width: 348
-            height: 348
-            radius: 174
-            bg_opa: TRANSP
-            border_width: 6
-            border_color: 0x2A6FB0
-            pad_all: 0
-            clickable: false
-            scrollable: false
+            width: 344
+            height: 344
+            start_angle: 270
+            end_angle: 268
+            min_value: 0
+            max_value: 100
+            value: 100
+            adjustable: false
+            arc_width: 14
+            arc_color: 0x101822
+            indicator:
+              arc_width: 14
+              arc_color: 0x2A6FB0
         - label:
-            text: "\U000F04D3"
-            text_font: mdi_64
+            id: lbl_clean_head
+            text: "MOVE THE PADDLE"
+            text_font: montserrat_20
             text_color: 0x4FA3E3
             align: CENTER
-            y: -78
+            y: -86
         - label:
-            text: "STEAMING"
-            text_font: montserrat_40
+            id: lbl_clean_big
+            text: "15"
+            text_font: montserrat_48
             text_color: 0xFFFFFF
             align: CENTER
-            y: 20
+            y: 0
         - label:
-            text: "milk"
+            id: lbl_clean_sub
+            text: "seconds to activate"
             text_font: montserrat_16
-            text_color: 0x4A6A8A
+            text_color: 0x8A8A8A
             align: CENTER
-            y: 82
+            y: 66
 
     # ---------------- RESULT (Mahlkonig Sync bundle) ----------------
     - id: page_result
       bg_color: 0x000000
+      # Tap: advance/commit the rating if rating, otherwise go home.
+      # Hold: enter/leave rate mode -- the values the machine can't measure.
+      on_short_click:
+        - script.execute: rate_tap
+      on_long_press:
+        - script.execute: rate_hold
       widgets:
         - obj:
             id: ring_result
@@ -1133,45 +2654,256 @@ lvgl:
             clickable: false
             scrollable: false
         - label:
-            id: lbl_res_head
-            text: "SHOT"
+            id: lbl_res_when
+            text: "--"
             text_font: montserrat_16
             text_color: 0x707070
-            text_letter_space: 4
             align: CENTER
-            y: -96
+            y: -104
         - label:
             id: lbl_res_ratio
             text: "1 : 0.0"
             text_font: montserrat_48
             text_color: 0xE31E24
             align: CENTER
-            y: -34
+            y: -52
         - label:
             id: lbl_res_gram
             text: "0.0 -> 0.0 g"
             text_font: montserrat_20
             text_color: 0xFFFFFF
             align: CENTER
-            y: 22
+            y: 2
         - label:
             id: lbl_res_meta
-            text: "0.0 s  |  --"
+            text: "0.0 s"
             text_font: montserrat_16
             text_color: 0x8A8A8A
             align: CENTER
-            y: 60
+            y: 36
         - label:
             id: lbl_res_grind
             text: ""
             text_font: montserrat_16
             text_color: 0x6A6A6A
             align: CENTER
-            y: 92
+            y: 64
+        - label:
+            id: lbl_res_rate
+            text: "hold to rate"
+            text_font: montserrat_16
+            text_color: 0x8A7A55
+            align: CENTER
+            y: 96
+        - label:
+            id: lbl_res_step
+            text: ""
+            text_font: montserrat_16
+            text_color: 0x6A6A6A
+            align: CENTER
+            y: 122
+
+    # ---------------- GRINDER (card 2) ----------------
+    # Mahlkonig Sync data, which until now only appeared for 15 s after a
+    # shot. Reachable any time by turning the knob.
+    - id: page_grind
+      bg_color: 0x000000
+      # One-touch escape from any secondary card.
+      on_short_click:
+        - script.execute: go_main
+      widgets:
+        - obj:
+            id: ring_grind
+            align: CENTER
+            width: 348
+            height: 348
+            radius: 174
+            bg_opa: TRANSP
+            border_width: 6
+            border_color: 0xC8913C
+            pad_all: 0
+            clickable: false
+            scrollable: false
+        - label:
+            text: "GRINDER"
+            text_font: montserrat_16
+            text_color: 0xC8913C
+            text_letter_space: 4
+            align: CENTER
+            y: -108
+        - label:
+            id: lbl_gr_dose
+            text: "--"
+            text_font: montserrat_48
+            text_color: 0xFFFFFF
+            align: CENTER
+            y: -52
+        - label:
+            id: lbl_gr_setting
+            text: "--"
+            text_font: montserrat_20
+            text_color: 0xC8913C
+            align: CENTER
+            y: 4
+        - label:
+            id: lbl_gr_meta
+            text: "--"
+            text_font: montserrat_16
+            text_color: 0x8A8A8A
+            align: CENTER
+            y: 38
+        # Which beans, and how old. Two lines rather than one because the
+        # roast line is the actionable half and should keep its own colour.
+        - label:
+            id: lbl_gr_beans
+            text: "--"
+            text_font: montserrat_16
+            text_color: 0xC8913C
+            align: CENTER
+            y: 66
+        - label:
+            id: lbl_gr_roast
+            text: ""
+            text_font: montserrat_16
+            text_color: 0x8A8A8A
+            align: CENTER
+            y: 90
+        - label:
+            id: lbl_gr_ago
+            text: "--"
+            text_font: montserrat_16
+            text_color: 0x6A6A6A
+            align: CENTER
+            y: 116
+
+    # ---------------- CARE (card 3) ----------------
+    - id: page_care
+      bg_color: 0x000000
+      # One-touch escape from any secondary card.
+      on_short_click:
+        - script.execute: go_main
+      widgets:
+        - obj:
+            id: ring_care
+            align: CENTER
+            width: 348
+            height: 348
+            radius: 174
+            bg_opa: TRANSP
+            border_width: 6
+            border_color: 0x2A6FB0
+            pad_all: 0
+            clickable: false
+            scrollable: false
+        - label:
+            text: "CARE"
+            text_font: montserrat_16
+            text_color: 0x4FA3E3
+            text_letter_space: 4
+            align: CENTER
+            y: -96
+        - label:
+            id: lbl_care_ago
+            text: "--"
+            text_font: montserrat_48
+            text_color: 0x585858
+            align: CENTER
+            y: -34
+        - label:
+            text: "since backflush"
+            text_font: montserrat_16
+            text_color: 0x707070
+            align: CENTER
+            y: 18
+        - label:
+            id: lbl_care_shots
+            text: "--"
+            text_font: montserrat_16
+            text_color: 0x8A8A8A
+            align: CENTER
+            y: 54
+        - label:
+            id: lbl_care_water
+            text: "--"
+            text_font: montserrat_16
+            text_color: 0x6A6A6A
+            align: CENTER
+            y: 86
+
+    # ---------------- BOILERS (card 4) ----------------
+    # Read-only on purpose: temperature and steam level are EDITED on the
+    # control page, and having two places that both look editable is how you
+    # end up changing the wrong one.
+    - id: page_boil
+      bg_color: 0x000000
+      # One-touch escape from any secondary card.
+      on_short_click:
+        - script.execute: go_main
+      widgets:
+        - obj:
+            id: ring_boil
+            align: CENTER
+            width: 348
+            height: 348
+            radius: 174
+            bg_opa: TRANSP
+            border_width: 6
+            border_color: 0xE31E24
+            pad_all: 0
+            clickable: false
+            scrollable: false
+        - label:
+            text: "BOILERS"
+            text_font: montserrat_16
+            text_color: 0xB05055
+            text_letter_space: 4
+            align: CENTER
+            y: -96
+        - label:
+            id: lbl_bo_temp
+            text: "--"
+            text_font: montserrat_48
+            text_color: 0xFFFFFF
+            align: CENTER
+            y: -34
+        - label:
+            text: "target"
+            text_font: montserrat_16
+            text_color: 0x707070
+            align: CENTER
+            y: 18
+        - label:
+            id: lbl_bo_coffee
+            text: "--"
+            text_font: montserrat_20
+            text_color: 0x8A8A8A
+            align: CENTER
+            y: 54
+        - label:
+            id: lbl_bo_steam
+            text: "--"
+            text_font: montserrat_20
+            text_color: 0x8A8A8A
+            align: CENTER
+            y: 88
 
     # ---------------- SHOT ----------------
     - id: page_shot
       bg_color: 0x000000
+      # This page used to be a dead end: no gesture left it, so a slow
+      # grinder record read as a hang. It leaves on a gesture now -- but a
+      # capacitive panel sitting next to a steam wand picks up splashes and
+      # sleeves, and a stray tap must not throw away a shot you are watching.
+      # So while the timer is LIVE only a deliberate hold leaves; once
+      # extraction ends a tap is enough. The hint says which.
+      on_short_click:
+        - if:
+            condition:
+              lambda: 'return !id(shot_running);'
+            then:
+              - script.execute: go_main
+      on_long_press:
+        - script.execute: go_main
       widgets:
         - arc:
             id: arc_shot
@@ -1189,6 +2921,15 @@ lvgl:
             indicator:
               arc_width: 14
               arc_color: 0xE31E24
+        # Blank unless this shot is on non-hopper beans, so it is only ever
+        # present when it means something.
+        - label:
+            id: lbl_shot_beans
+            text: ""
+            text_font: montserrat_16
+            text_color: 0xE8A33D
+            align: CENTER
+            y: -112
         - label:
             id: lbl_shot_label
             text: "SHOT"
@@ -1210,3 +2951,12 @@ lvgl:
             text_color: 0x4A4A4A
             align: CENTER
             y: 86
+        # Switches between "hold" and "tap" so the gesture on offer is never
+        # a guess -- see the page's on_short_click for why they differ.
+        - label:
+            id: lbl_shot_hint
+            text: "tap to leave"
+            text_font: montserrat_16
+            text_color: 0x3A3A3A
+            align: CENTER
+            y: 120
