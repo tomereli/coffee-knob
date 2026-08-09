@@ -4,7 +4,15 @@ An ESPHome config that turns a **Waveshare ESP32-S3-Knob-Touch-LCD-1.8** (a.k.a.
 
 Everything runs through Home Assistant. Nothing depends on a cloud service at runtime — fonts and the logo are baked into the firmware at compile time.
 
-![board](https://www.waveshare.com/esp32-s3-knob-touch-lcd-1.8.htm)
+## Demo
+
+**The shot timer starts on its own.** The knob watches the machine — pull a shot and it jumps straight to a live timer with a filling ring. No tap, no old phone propped against the group head.
+
+![The shot timer starts automatically when the machine brews](demo-autostart.gif)
+
+When the Sync data lands, the result card shows the brew ratio, dose to yield, shot time against the recipe target, the machine's own verdict, and a two-step rating you dial in on the knob:
+
+![Shot result and two-step rating](demo-rating.gif)
 
 ---
 
