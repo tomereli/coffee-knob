@@ -21,11 +21,15 @@
 #   cards:    short tap -> back to MACHINE
 #   control:  turn -> move / adjust           short tap -> act
 #             long press -> back to main (or START backflush on that item)
-#   SHOT card: long press -> rate. Two steps, turn to pick, tap to advance,
+#   SHOT card: long press -> rate. Three steps, turn to pick, tap to advance,
 #             tap again to commit, long press to abandon.
-#               1/2 taste  SOUR - SOUR-ISH - BALANCED - BITTER-ISH - BITTER
-#               2/2 score  1 - 5
-#             Committing also writes one row to the Home Assistant shot log.
+#               1/3 serve  ESPRESSO - MILK
+#               2/3 taste  SOUR - SOUR-ISH - BALANCED - BITTER-ISH - BITTER
+#               3/3 score  1 - 5
+#             Serve comes first because it is the one fact you already know
+#             before tasting, and it frames the sour/bitter call rather than
+#             trailing it. Committing writes all three to Home Assistant and
+#             appends one row to the shot log.
 #   shot:     while the timer is LIVE, only a HOLD leaves (a stray tap next
 #             to a steam wand must not throw away a shot you are watching).
 #             Once extraction ends a tap is enough. Rotation is blocked only
@@ -201,6 +205,8 @@ font:
       - "󰒓"
       - "󰓓"
       - "󰔏"
+      - "󰔛"
+      - "󰖏"
       - "󰗑"
       - "󰫠"
       - "󱌙"
@@ -551,6 +557,16 @@ text_sensor:
             lambda: 'return id(grind_is_new);'
           then:
             - script.execute: shot_result
+
+  # Opens on whatever was chosen last, like the other two pickers -- people go
+  # through espresso phases and milk phases, so the previous answer is the
+  # better prior.
+  - platform: homeassistant
+    id: served_txt
+    entity_id: input_select.coffee_served_as
+    internal: true
+    on_value:
+      - lambda: 'if (!id(rate_mode)) id(serve_i) = (x == "Milk") ? 1 : 0;'
 
   - platform: homeassistant
     id: window_txt
@@ -950,8 +966,14 @@ globals:
     type: int
     restore_value: false
     initial_value: '0'
-  # 0 = picking taste, 1 = picking score. One tap between them, one write at
-  # the end -- an abandoned rating leaves nothing behind.
+  # 0 = espresso, 1 = milk. Same shot drunk two ways does not taste the same,
+  # so without this the taste and score columns are not comparable row to row.
+  - id: serve_i
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # 0 = picking serve, 1 = taste, 2 = score. One tap between them, one write
+  # at the end -- an abandoned rating leaves nothing behind.
   - id: rate_step
     type: int
     restore_value: false
@@ -1087,6 +1109,11 @@ script:
             # step you are on instead of sliding off the card entirely.
             - lambda: |-
                 if (id(rate_step) == 0) {
+                  int s = id(serve_i) + delta;
+                  if (s < 0) s = 0;
+                  if (s > 1) s = 1;
+                  id(serve_i) = s;
+                } else if (id(rate_step) == 1) {
                   int t = id(taste_val) + delta;
                   if (t < -2) t = -2;
                   if (t > 2) t = 2;
@@ -1341,11 +1368,20 @@ script:
           if (id(rate_mode)) id(rate_step) = 0;
       - script.execute: paint_result
 
-  # Tap advances, then commits. Both values are written together on the last
-  # tap, so abandoning halfway leaves Home Assistant untouched rather than
-  # recording a taste with no score. A stray tap outside rating just goes home.
+  # Tap advances, then commits. All THREE values are written together on the
+  # last tap, so abandoning halfway leaves Home Assistant untouched rather
+  # than recording a serve with no taste. A stray tap outside rating just
+  # goes home.
+  #
+  # mode: single, not restart. This script fires irreversible outward calls
+  # (three helper writes and a log append); on restart a second tap arriving
+  # mid-sequence would re-enter the commit branch with rate_mode still true
+  # and append a second row. single drops the re-entrant tap instead. The
+  # state flip below is the other half of that guard -- it happens BEFORE any
+  # action goes out, so even a dropped-then-retried tap finds rate_mode false
+  # and falls through to go_main.
   - id: rate_tap
-    mode: restart
+    mode: single
     then:
       - if:
           condition:
@@ -1357,11 +1393,30 @@ script:
             - script.execute: screentime
             - if:
                 condition:
-                  lambda: 'return id(rate_step) == 0;'
+                  lambda: 'return id(rate_step) < 2;'
                 then:
-                  - lambda: 'id(rate_step) = 1;'
+                  - lambda: 'id(rate_step) = id(rate_step) + 1;'
                   - script.execute: paint_result
                 else:
+                  # Close the gesture first, then report it. Nothing below
+                  # reads rate_mode or rate_step, and the three values live
+                  # in their own globals, so clearing here costs nothing and
+                  # removes the whole re-entrancy question.
+                  - lambda: |-
+                      id(rate_mode) = false;
+                      id(rate_step) = 0;
+                      id(rated_shot) = true;
+                  - script.execute: paint_result
+                  - homeassistant.action:
+                      action: input_select.select_option
+                      data:
+                        entity_id: input_select.coffee_served_as
+                      data_template:
+                        option: "{{ s }}"
+                      variables:
+                        s: !lambda |-
+                          return std::string(id(serve_i) == 0 ? "Espresso"
+                                                              : "Milk");
                   - homeassistant.action:
                       action: input_number.set_value
                       data:
@@ -1407,14 +1462,6 @@ script:
                               value: "{{ v }}"
                             variables:
                               v: !lambda 'return id(sync_yield).state;'
-                        - homeassistant.action:
-                            action: input_number.set_value
-                            data:
-                              entity_id: input_number.coffee_grind_setting
-                            data_template:
-                              value: "{{ v }}"
-                            variables:
-                              v: !lambda 'return id(sync_grind).state;'
                   # ORDER MATTERS. Every write above has to land before this
                   # runs, because the script reads all of them back out of
                   # Home Assistant to build the row.
@@ -1432,11 +1479,6 @@ script:
                           if (id(shot_ds) > 0) return id(shot_ds) / 10.0f;
                           float t = id(sync_time).state;
                           return std::isnan(t) ? 0.0f : t;
-                  - lambda: |-
-                      id(rate_mode) = false;
-                      id(rate_step) = 0;
-                      id(rated_shot) = true;
-                  - script.execute: paint_result
                   - delay: 900ms
                   - script.execute: go_main
           else:
@@ -2360,14 +2402,16 @@ script:
           text_color: !lambda |-
             uint32_t c = (id(grind_delta) != 0.0f) ? 0xC8913C : 0x6A6A6A;
             return lv_color_hex(c);
-      # Two-step rating lives on this one line. Step 0 is the taste axis --
-      # sour and bitter are the only tasting words that mean something
-      # mechanical (under- vs over-extracted), so that is the axis worth a
-      # dedicated step. Step 1 is plain liking, which no measurement implies.
+      # Three-step rating lives on this one line. Step 0 is how it was drunk,
+      # which is known before tasting and frames everything after it. Step 1
+      # is the taste axis -- sour and bitter are the only tasting words that
+      # mean something mechanical (under- vs over-extracted). Step 2 is plain
+      # liking, which no measurement implies. Once logged the line leads with
+      # the serve, because it is the field that explains the other two.
       - lvgl.label.update:
           id: lbl_res_rate
           text: !lambda |-
-            static char b[32];
+            static char b[40];
             static const char *TP[] = {"SOUR", "SOUR-ISH", "BALANCED",
                                        "BITTER-ISH", "BITTER"};
             static const char *TS[] = {"sour", "sour-ish", "balanced",
@@ -2376,12 +2420,16 @@ script:
             if (i < 0) i = 0;
             if (i > 4) i = 4;
             if (id(rate_mode)) {
-              if (id(rate_step) == 0) return std::string(TP[i]);
+              if (id(rate_step) == 0)
+                return std::string(id(serve_i) == 0 ? "ESPRESSO" : "MILK");
+              if (id(rate_step) == 1) return std::string(TP[i]);
               snprintf(b, sizeof(b), "%d / 5", id(rate_val));
               return std::string(b);
             }
             if (id(rated_shot)) {
-              snprintf(b, sizeof(b), "%s   %d / 5", TS[i], id(rate_val));
+              snprintf(b, sizeof(b), "%s - %s   %d / 5",
+                       id(serve_i) == 0 ? "espresso" : "milk",
+                       TS[i], id(rate_val));
               return std::string(b);
             }
             return std::string("hold to rate");
@@ -2395,8 +2443,10 @@ script:
             int i = id(taste_val) + 2;
             if (i < 0) i = 0;
             if (i > 4) i = 4;
+            // Only the taste step carries a colour of its own -- the word IS
+            // the reading, so the sour/bitter end is legible without reading.
             if (id(rate_mode))
-              return lv_color_hex(id(rate_step) == 0 ? TC[i] : 0xFFFFFF);
+              return lv_color_hex(id(rate_step) == 1 ? TC[i] : 0xFFFFFF);
             if (id(rated_shot)) return lv_color_hex(0x7A7A7A);
             return lv_color_hex(0x8A7A55);
       # Only visible while rating: which step you are on, so two taps never
@@ -2405,8 +2455,9 @@ script:
           id: lbl_res_step
           text: !lambda |-
             if (!id(rate_mode)) return std::string("");
-            return std::string(id(rate_step) == 0 ? "taste      1 / 2"
-                                                  : "score      2 / 2");
+            if (id(rate_step) == 0) return std::string("serve      1 / 3");
+            if (id(rate_step) == 1) return std::string("taste      2 / 3");
+            return std::string("score      3 / 3");
 
   # Only ever says something when this shot is NOT on the hopper beans, so
   # its presence alone is the signal. Painted on change and at shot start,
