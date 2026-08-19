@@ -53,6 +53,8 @@ substitutions:
   micra_temp:        number.la_minea_micra_coffee_target_temperature
   micra_backflush:   button.la_minea_micra_start_backflush
   micra_cleaning:    binary_sensor.la_minea_micra_backflush_active
+  micra_preinf_mode: select.la_minea_micra_prebrew_infusion_mode
+  micra_preinf_time: number.la_minea_micra_preinfusion_time
   # Machine-measured: paddle window ~15 s, full cycle ~90 s from the ON edge.
   clean_arm_ds:      "160"
   clean_total_ds:    "900"
@@ -391,6 +393,18 @@ sensor:
       - script.execute: paint_cfg
       - script.execute: paint_boil
 
+  # Goes unavailable whenever the mode is not 'preinfusion', so a NaN here
+  # means "not applicable" rather than zero -- keep the last good value so
+  # the card does not flash 0.0s every time the mode changes.
+  - platform: homeassistant
+    id: preinf_time
+    entity_id: $micra_preinf_time
+    internal: true
+    on_value:
+      - lambda: |-
+          if (!id(cfg_edit) && !std::isnan(x)) id(preinf_time_val) = x;
+      - script.execute: paint_cfg
+
   # --- Battery ---
   # The board does have an MX1.25 li-po socket and a charge-management IC,
   # and system voltage reaches the MCU on GPIO1 (ADC1_CH0) behind a 2:1
@@ -624,6 +638,18 @@ text_sensor:
       - script.execute: paint_cfg
       - script.execute: paint_boil
 
+  # 0 disabled / 1 prebrew / 2 preinfusion -- the order the select reports.
+  - platform: homeassistant
+    id: preinf_mode_txt
+    entity_id: $micra_preinf_mode
+    internal: true
+    on_value:
+      - lambda: |-
+          if      (x == "disabled")    id(preinf_mode_val) = 0;
+          else if (x == "prebrew")     id(preinf_mode_val) = 1;
+          else if (x == "preinfusion") id(preinf_mode_val) = 2;
+      - script.execute: paint_cfg
+
 button:
   - platform: restart
     name: "Restart"
@@ -811,6 +837,16 @@ globals:
     type: float
     restore_value: false
     initial_value: '1.80f'
+  # Machine pre-infusion: mode is the select, time only applies in
+  # 'preinfusion' mode (prebrew uses its own on/off pair instead).
+  - id: preinf_mode_val
+    type: int
+    restore_value: false
+    initial_value: '2'
+  - id: preinf_time_val
+    type: float
+    restore_value: false
+    initial_value: '8.0f'
   # The La Marzocco integration reports optimistically and rolls back if the
   # command fails, so its state bounces for a few seconds after anything we
   # send. Hold our own intent over that window so the display does not
@@ -1796,10 +1832,15 @@ script:
             // own select_next / select_previous do the walking, fired from
             // the actions below -- so this branch exists only to stop the
             // cursor sliding off the item while it is being edited.
+          } else if (id(cfg_edit) && id(cfg_i) == 6) {
+            float p = id(preinf_time_val) + 0.5f * delta;
+            if (p < 0.0f)  p = 0.0f;
+            if (p > 30.0f) p = 30.0f;
+            id(preinf_time_val) = p;
           } else {
-            // SEVEN items now. Renumbering this list means touching four
+            // NINE items now. Renumbering this list means touching four
             // places: here, cfg_act, paint_cfg, and page_cfg's on_long_press.
-            const int n = 7;
+            const int n = 9;
             id(cfg_i) = ((id(cfg_i) + delta) % n + n) % n;
           }
       - if:
@@ -1833,6 +1874,11 @@ script:
                 data:
                   entity_id: input_select.coffee_current_beans
                   cycle: "true"
+      - if:
+          condition:
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 6;'
+          then:
+            - script.execute: push_preinf
       - script.execute: paint_cfg
 
   # Debounced: only sends once the knob stops, so a fast spin does not fire
@@ -1863,6 +1909,19 @@ script:
             value: "{{ r }}"
           variables:
             r: !lambda 'return id(ratio_val);'
+
+  - id: push_preinf
+    mode: restart
+    then:
+      - delay: 600ms
+      - homeassistant.action:
+          action: number.set_value
+          data:
+            entity_id: $micra_preinf_time
+          data_template:
+            value: "{{ p }}"
+          variables:
+            p: !lambda 'return id(preinf_time_val);'
 
   - id: cfg_act
     mode: restart
@@ -1907,12 +1966,34 @@ script:
       - if:
           condition:
             lambda: |-
-              return id(cfg_i) == 2 || id(cfg_i) == 3 || id(cfg_i) == 4;
+              return id(cfg_i) == 2 || id(cfg_i) == 3 || id(cfg_i) == 4
+                  || id(cfg_i) == 6;
           then:
             - lambda: 'id(cfg_edit) = !id(cfg_edit);'
       - if:
           condition:
-            lambda: 'return id(cfg_i) == 6;'
+            lambda: 'return id(cfg_i) == 5;'
+          then:
+            - lambda: |-
+                int m = id(preinf_mode_val) + 1;
+                if (m > 2) m = 0;
+                id(preinf_mode_val) = m;
+            - homeassistant.action:
+                action: select.select_option
+                data:
+                  entity_id: $micra_preinf_mode
+                data_template:
+                  option: "{{ opt }}"
+                variables:
+                  opt: !lambda |-
+                    switch (id(preinf_mode_val)) {
+                      case 0:  return std::string("disabled");
+                      case 1:  return std::string("prebrew");
+                      default: return std::string("preinfusion");
+                    }
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 8;'
           then:
             - lambda: 'id(cfg_edit) = false;'
             - script.execute: go_main
@@ -2045,9 +2126,66 @@ script:
                   std::string s = id(cfg_edit) ? "turn to pick, tap to keep"
                                                : "tap to change";
                   return s;
+      # Machine pre-infusion. Disabled / prebrew (pump pulses on-off-on) /
+      # preinfusion (line pressure only, then the pump). The Micra exposes
+      # them as one select, so this cycles rather than toggles.
       - if:
           condition:
             lambda: 'return id(cfg_i) == 5;'
+          then:
+            - lvgl.label.update:
+                id: lbl_cfg_icon
+                text: "󰖏"
+            - lvgl.label.update:
+                id: lbl_cfg_name
+                text: "PRE-INFUSION"
+            - lvgl.label.update:
+                id: lbl_cfg_value
+                text_font: montserrat_20
+                text: !lambda |-
+                  switch (id(preinf_mode_val)) {
+                    case 0:  return "OFF";
+                    case 1:  return "PREBREW";
+                    default: return "PREINFUSION";
+                  }
+            - lvgl.label.update:
+                id: lbl_cfg_hint
+                text: "tap to cycle"
+      # Only meaningful in preinfusion mode -- prebrew uses its own on/off
+      # pair, which HA exposes as two other numbers, and marks this one
+      # unavailable. Show n/a rather than a stale figure.
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 6;'
+          then:
+            - lvgl.label.update:
+                id: lbl_cfg_icon
+                text: "󰔛"
+            - lvgl.label.update:
+                id: lbl_cfg_name
+                text: "PRE-INF TIME"
+            - lvgl.label.update:
+                id: lbl_cfg_value
+                text_font: montserrat_48
+                text: !lambda |-
+                  static char b[12];
+                  if (id(preinf_mode_val) != 2) {
+                    snprintf(b, sizeof(b), "n/a");
+                  } else {
+                    snprintf(b, sizeof(b), "%.1fs", id(preinf_time_val));
+                  }
+                  return b;
+            - lvgl.label.update:
+                id: lbl_cfg_hint
+                text: !lambda |-
+                  if (id(preinf_mode_val) != 2) {
+                    return std::string("set mode to PREINFUSION");
+                  }
+                  return id(cfg_edit) ? std::string("turn to set, tap to save")
+                                      : std::string("tap to adjust");
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 7;'
           then:
             - lvgl.label.update:
                 id: lbl_cfg_icon
@@ -2064,7 +2202,7 @@ script:
                 text: "HOLD to start"
       - if:
           condition:
-            lambda: 'return id(cfg_i) == 6;'
+            lambda: 'return id(cfg_i) == 8;'
           then:
             - lvgl.label.update:
                 id: lbl_cfg_icon
@@ -2523,7 +2661,7 @@ lvgl:
       on_long_press:
         - if:
             condition:
-              lambda: 'return id(cfg_i) == 5;'
+              lambda: 'return id(cfg_i) == 7;'
             then:
               - logger.log: "CFG: starting backflush"
               # Everything about arming lives in start_clean, including the
