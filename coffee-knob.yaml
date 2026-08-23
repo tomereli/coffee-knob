@@ -20,7 +20,17 @@
 #   main:     tap the buttons               long press -> wake / standby
 #   cards:    short tap -> back to MACHINE
 #   control:  turn -> move / adjust           short tap -> act
-#             long press -> back to main (or START backflush on that item)
+#             long press -> back to main, EXCEPT on two items:
+#               BACKFLUSH  hold starts the cycle
+#               BEANS      hold saves the machine settings on screen into
+#                          the slot for the grinder's current recipe
+#             twelve items:
+#               steam boiler, steam level, coffee temp, target ratio,
+#               target time, beans, pre-infusion mode, pre-infusion time,
+#               prebrew on, prebrew off, backflush, back
+#             TARGET TIME at 0 means "follow the grinder's recipe"; any
+#             other value overrides it, because the recipe target can only
+#             be changed at the grinder itself.
 #   SHOT card: long press -> rate. Three steps, turn to pick, tap to advance,
 #             tap again to commit, long press to abandon.
 #               1/3 serve  ESPRESSO - MILK
@@ -59,6 +69,13 @@ substitutions:
   micra_cleaning:    binary_sensor.la_minea_micra_backflush_active
   micra_preinf_mode: select.la_minea_micra_prebrew_infusion_mode
   micra_preinf_time: number.la_minea_micra_preinfusion_time
+  micra_prebrew_on:  number.la_minea_micra_prebrew_on_time
+  micra_prebrew_off: number.la_minea_micra_prebrew_off_time
+  # La Marzocco ask for a backflush daily, so hours is the primary axis and
+  # shots is the secondary one -- a quiet day and a heavy day are not the
+  # same amount of dirt. Whichever crosses first wins.
+  clean_warn_shots:  "20"
+  clean_due_shots:   "35"
   # Machine-measured: paddle window ~15 s, full cycle ~90 s from the ON edge.
   clean_arm_ds:      "160"
   clean_total_ds:    "900"
@@ -369,8 +386,10 @@ sensor:
     entity_id: input_number.coffee_target_shot_time
     internal: true
     on_value:
+      - lambda: 'if (!id(cfg_edit)) id(tgt_time_val) = x;'
       - script.execute: paint_result
       - script.execute: paint_main
+      - script.execute: paint_cfg
   - platform: homeassistant
     id: tgt_time_tol
     entity_id: input_number.coffee_shot_time_tolerance
@@ -403,6 +422,50 @@ sensor:
       - lambda: 'if (!id(cfg_edit)) id(coffee_temp_val) = x;'
       - script.execute: paint_cfg
       - script.execute: paint_boil
+
+  # The prebrew pair. Live only while the mode is 'prebrew'; NaN otherwise,
+  # which is why every read is guarded the same way preinf_time is.
+  - platform: homeassistant
+    id: prebrew_on
+    entity_id: $micra_prebrew_on
+    internal: true
+    on_value:
+      - lambda: |-
+          if (!id(cfg_edit) && !std::isnan(x)) id(prebrew_on_val) = x;
+      - script.execute: paint_cfg
+
+  - platform: homeassistant
+    id: prebrew_off
+    entity_id: $micra_prebrew_off
+    internal: true
+    on_value:
+      - lambda: |-
+          if (!id(cfg_edit) && !std::isnan(x)) id(prebrew_off_val) = x;
+      - script.execute: paint_cfg
+
+  # total_coffees_made never resets, so shots-since-clean needs a baseline
+  # recorded at each backflush. An HA automation writes it; see the CARE card.
+  - platform: homeassistant
+    id: shots_base
+    entity_id: input_number.coffee_shots_at_last_clean
+    internal: true
+    on_value:
+      - script.execute: paint_care
+      - script.execute: paint_main
+
+  # The grinder reports WHICH cloud recipe is loaded, but never its name --
+  # the app has no rename. The index is the only handle there is, so it is
+  # what the per-bean presets are keyed on.
+  - platform: homeassistant
+    id: recipe_idx
+    entity_id: sensor.mahlkonig_e64_ws_recipe_index
+    internal: true
+    on_value:
+      - lambda: |-
+          int i = (int) x;
+          if (i >= 0 && i <= 2) id(recipe_i) = i;
+      - script.execute: preset_apply
+      - script.execute: paint_grind
 
   # Goes unavailable whenever the mode is not 'preinfusion', so a NaN here
   # means "not applicable" rather than zero -- keep the last good value so
@@ -868,6 +931,45 @@ globals:
     type: float
     restore_value: false
     initial_value: '8.0f'
+  - id: prebrew_on_val
+    type: float
+    restore_value: false
+    initial_value: '3.0f'
+  - id: prebrew_off_val
+    type: float
+    restore_value: false
+    initial_value: '3.0f'
+  # 0 means "follow the Mahlkonig recipe". Any other value overrides it --
+  # the grinder's target can only be changed from the grinder, so this is
+  # the only way to aim at a different time from the machine side.
+  - id: tgt_time_val
+    type: float
+    restore_value: false
+    initial_value: '0.0f'
+  - id: shots_since_clean
+    type: int
+    restore_value: false
+    initial_value: '-1'
+  - id: recipe_i
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Per-recipe presets, indexed by recipe_i. Kept in flash rather than in
+  # Home Assistant so a preset survives a restart of either side, and so
+  # saving one is a gesture on the knob rather than a trip to a dashboard.
+  # 0 in a slot means "never saved" and apply skips it.
+  - id: preset_temp
+    type: float[3]
+    restore_value: true
+    initial_value: '{0.0f, 0.0f, 0.0f}'
+  - id: preset_ratio
+    type: float[3]
+    restore_value: true
+    initial_value: '{0.0f, 0.0f, 0.0f}'
+  - id: preset_preinf
+    type: float[3]
+    restore_value: true
+    initial_value: '{0.0f, 0.0f, 0.0f}'
   # The La Marzocco integration reports optimistically and rolls back if the
   # command fails, so its state bounces for a few seconds after anything we
   # send. Hold our own intent over that window so the display does not
@@ -1297,6 +1399,15 @@ script:
   - id: paint_care
     mode: restart
     then:
+      # total_coffees_made is cumulative and never resets, so the useful
+      # number is the difference from the count recorded at the last clean.
+      # -1 means the baseline has not been written yet; fall back to total.
+      - lambda: |-
+          float t = id(total_shots).state;
+          float base = id(shots_base).state;
+          id(shots_since_clean) =
+              (!std::isnan(t) && !std::isnan(base) && base > 0.0f)
+                  ? (int) (t - base) : -1;
       - lvgl.label.update:
           id: lbl_care_ago
           text: !lambda 'return id(ago_clean);'
@@ -1310,9 +1421,21 @@ script:
       - lvgl.label.update:
           id: lbl_care_shots
           text: !lambda |-
-            static char b[28];
-            snprintf(b, sizeof(b), "%d shots total", (int) id(total_shots).state);
+            static char b[36];
+            int since = id(shots_since_clean);
+            if (since < 0) {
+              snprintf(b, sizeof(b), "%d shots total",
+                       (int) id(total_shots).state);
+            } else {
+              snprintf(b, sizeof(b), "%d shots since clean", since);
+            }
             return std::string(b);
+          text_color: !lambda |-
+            int since = id(shots_since_clean);
+            if (since < 0) return lv_color_hex(0x6A6A6A);
+            if (since >= $clean_due_shots)  return lv_color_hex(0xE31E24);
+            if (since >= $clean_warn_shots) return lv_color_hex(0xE8A33D);
+            return lv_color_hex(0x6A6A6A);
       - lvgl.label.update:
           id: lbl_care_water
           text: !lambda |-
@@ -1527,9 +1650,13 @@ script:
           if (std::isnan(tr) || tr <= 0.0f) tr = 1.80f;
           if (std::isnan(tt) || tt <= 0.0f) tt = 0.10f;
           if (std::isnan(tv) || tv <= 0.0f) tv = 5.0f;
-          // Prefer the recipe's own brew-time target over the local helper:
-          // change the recipe in the Mahlkonig app and the knob follows.
-          float ts = id(mk_time_target).state;
+          // Precedence: the knob's own target first, then the recipe's,
+          // then the helper, then a sane default. The recipe target can only
+          // be changed at the grinder, so an override here is the only way
+          // to aim at a different time from the machine side. 0 is not a
+          // time -- it means "no override", and the recipe wins again.
+          float ts = id(tgt_time_val);
+          if (ts <= 0.0f) ts = id(mk_time_target).state;
           if (std::isnan(ts) || ts <= 0.0f) ts = id(tgt_time).state;
           if (std::isnan(ts) || ts <= 0.0f) ts = 25.0f;
           float r = id(last_ratio);
@@ -1539,8 +1666,13 @@ script:
           // Time is judged by Mahlkonig when Mahlkonig has an opinion. Only
           // if it is silent do we fall back to comparing against the target
           // ourselves -- so the two can never reach opposite conclusions.
+          // ...but only while we are still aiming at Mahlkonig's target.
+          // Once overridden its verdict is judging a different question, so
+          // it has to be dropped or the ring and the number disagree.
+          bool time_override = id(tgt_time_val) > 0.0f;
           auto tq = id(mk_time_quality).state;
-          bool have_tq = (tq == "OK" || tq == "OFF_BELOW" || tq == "OFF_ABOVE");
+          bool have_tq = !time_override &&
+                         (tq == "OK" || tq == "OFF_BELOW" || tq == "OFF_ABOVE");
           bool t_ok = have_tq ? (tq == "OK")
                     : (have_time && st >= ts - tv && st <= ts + tv);
           id(ratio_c) = r_ok ? 0x35C759 : 0xE31E24;
@@ -1587,6 +1719,26 @@ script:
           id: ring
           border_color: !lambda 'return lv_color_hex(id(main_ring_c));'
           border_width: 6
+      # Hours and shots are two different ways of being dirty -- a quiet day
+      # and a heavy one are not the same. Whichever crosses first wins, and
+      # the main card is where it has to show, because the CARE card is a
+      # place you only go when you already suspect something.
+      - lvgl.label.update:
+          id: lbl_main_care
+          text: !lambda |-
+            int h = id(clean_age_h);
+            int n = id(shots_since_clean);
+            bool due  = (h >= 48) || (n >= $clean_due_shots);
+            bool soon = (h >= 24) || (n >= $clean_warn_shots);
+            if (due)  return std::string("backflush due");
+            if (soon) return std::string("backflush soon");
+            return std::string("");
+          text_color: !lambda |-
+            int h = id(clean_age_h);
+            int n = id(shots_since_clean);
+            if ((h >= 48) || (n >= $clean_due_shots))
+              return lv_color_hex(0xE31E24);
+            return lv_color_hex(0xB0823A);
       - lvgl.label.update:
           id: lbl_last
           text: !lambda |-
@@ -1874,20 +2026,37 @@ script:
             if (r > 3.00f) r = 3.00f;
             id(ratio_val) = r;
           } else if (id(cfg_edit) && id(cfg_i) == 4) {
+            // Whole seconds: the grinder's own target is a whole number, and
+            // half-second precision on a shot target is false accuracy.
+            float t = id(tgt_time_val) + 1.0f * delta;
+            if (t < 0.0f)  t = 0.0f;
+            if (t > 45.0f) t = 45.0f;
+            id(tgt_time_val) = t;
+          } else if (id(cfg_edit) && id(cfg_i) == 5) {
             // Beans have no local value to hold: the option list lives in
             // Home Assistant and the knob never sees it. Home Assistant's
             // own select_next / select_previous do the walking, fired from
             // the actions below -- so this branch exists only to stop the
             // cursor sliding off the item while it is being edited.
-          } else if (id(cfg_edit) && id(cfg_i) == 6) {
+          } else if (id(cfg_edit) && id(cfg_i) == 7) {
             float p = id(preinf_time_val) + 0.5f * delta;
             if (p < 0.0f)  p = 0.0f;
             if (p > 30.0f) p = 30.0f;
             id(preinf_time_val) = p;
+          } else if (id(cfg_edit) && id(cfg_i) == 8) {
+            float p = id(prebrew_on_val) + 0.1f * delta;
+            if (p < 0.0f)  p = 0.0f;
+            if (p > 30.0f) p = 30.0f;
+            id(prebrew_on_val) = p;
+          } else if (id(cfg_edit) && id(cfg_i) == 9) {
+            float p = id(prebrew_off_val) + 0.1f * delta;
+            if (p < 0.0f)  p = 0.0f;
+            if (p > 30.0f) p = 30.0f;
+            id(prebrew_off_val) = p;
           } else {
-            // NINE items now. Renumbering this list means touching four
+            // TWELVE items now. Renumbering this list means touching four
             // places: here, cfg_act, paint_cfg, and page_cfg's on_long_press.
-            const int n = 9;
+            const int n = 12;
             id(cfg_i) = ((id(cfg_i) + delta) % n + n) % n;
           }
       - if:
@@ -1905,7 +2074,12 @@ script:
       # that knows how many there are.
       - if:
           condition:
-            lambda: 'return id(cfg_edit) && id(cfg_i) == 4 && delta > 0;'
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 4;'
+          then:
+            - script.execute: push_tgt_time
+      - if:
+          condition:
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 5 && delta > 0;'
           then:
             - homeassistant.action:
                 action: input_select.select_next
@@ -1914,7 +2088,7 @@ script:
                   cycle: "true"
       - if:
           condition:
-            lambda: 'return id(cfg_edit) && id(cfg_i) == 4 && delta < 0;'
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 5 && delta < 0;'
           then:
             - homeassistant.action:
                 action: input_select.select_previous
@@ -1923,9 +2097,19 @@ script:
                   cycle: "true"
       - if:
           condition:
-            lambda: 'return id(cfg_edit) && id(cfg_i) == 6;'
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 7;'
           then:
             - script.execute: push_preinf
+      - if:
+          condition:
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 8;'
+          then:
+            - script.execute: push_prebrew_on
+      - if:
+          condition:
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 9;'
+          then:
+            - script.execute: push_prebrew_off
       - script.execute: paint_cfg
 
   # Debounced: only sends once the knob stops, so a fast spin does not fire
@@ -1969,6 +2153,123 @@ script:
             value: "{{ p }}"
           variables:
             p: !lambda 'return id(preinf_time_val);'
+
+  - id: push_prebrew_on
+    mode: restart
+    then:
+      - delay: 600ms
+      - homeassistant.action:
+          action: number.set_value
+          data:
+            entity_id: $micra_prebrew_on
+          data_template:
+            value: "{{ p }}"
+          variables:
+            p: !lambda 'return id(prebrew_on_val);'
+
+  - id: push_prebrew_off
+    mode: restart
+    then:
+      - delay: 600ms
+      - homeassistant.action:
+          action: number.set_value
+          data:
+            entity_id: $micra_prebrew_off
+          data_template:
+            value: "{{ p }}"
+          variables:
+            p: !lambda 'return id(prebrew_off_val);'
+
+  - id: push_tgt_time
+    mode: restart
+    then:
+      - delay: 600ms
+      - homeassistant.action:
+          action: input_number.set_value
+          data:
+            entity_id: input_number.coffee_target_shot_time
+          data_template:
+            value: "{{ t }}"
+          variables:
+            t: !lambda 'return id(tgt_time_val);'
+
+  # --- Per-recipe presets -------------------------------------------------
+  # The grinder holds three cloud recipes and reports only WHICH one is
+  # loaded -- there is no name, and the app has no rename. Switching recipe
+  # is already how a different bag gets dialled in, so that index is the
+  # natural key for "the machine settings that belong with these beans".
+  # Saving is a HOLD on the BEANS item; applying happens by itself when the
+  # grinder reports a different recipe.
+  - id: preset_save
+    mode: restart
+    then:
+      - script.execute:
+          id: haptic
+          effect: 1
+      - lambda: |-
+          int i = id(recipe_i);
+          if (i < 0 || i > 2) return;
+          id(preset_temp)[i]   = id(coffee_temp_val);
+          id(preset_ratio)[i]  = id(ratio_val);
+          id(preset_preinf)[i] = id(preinf_time_val);
+          ESP_LOGI("preset", "saved slot %d: %.1fC 1:%.2f %.1fs", i,
+                   id(coffee_temp_val), id(ratio_val), id(preinf_time_val));
+      - script.execute: paint_cfg
+
+  # A slot left at 0 was never saved, so applying it would push nonsense at
+  # the machine. Each field is guarded on its own -- a half-filled slot is
+  # still worth the half it has.
+  - id: preset_apply
+    mode: restart
+    then:
+      - delay: 300ms
+      - if:
+          condition:
+            lambda: |-
+              int i = id(recipe_i);
+              return i >= 0 && i <= 2 && id(preset_temp)[i] > 1.0f;
+          then:
+            - lambda: 'id(coffee_temp_val) = id(preset_temp)[id(recipe_i)];'
+            - homeassistant.action:
+                action: number.set_value
+                data:
+                  entity_id: $micra_temp
+                data_template:
+                  value: "{{ t }}"
+                variables:
+                  t: !lambda 'return id(coffee_temp_val);'
+      - if:
+          condition:
+            lambda: |-
+              int i = id(recipe_i);
+              return i >= 0 && i <= 2 && id(preset_ratio)[i] > 0.5f;
+          then:
+            - lambda: 'id(ratio_val) = id(preset_ratio)[id(recipe_i)];'
+            - homeassistant.action:
+                action: input_number.set_value
+                data:
+                  entity_id: input_number.coffee_target_ratio
+                data_template:
+                  value: "{{ r }}"
+                variables:
+                  r: !lambda 'return id(ratio_val);'
+      - if:
+          condition:
+            lambda: |-
+              int i = id(recipe_i);
+              return i >= 0 && i <= 2 && id(preset_preinf)[i] > 0.05f;
+          then:
+            - lambda: 'id(preinf_time_val) = id(preset_preinf)[id(recipe_i)];'
+            - homeassistant.action:
+                action: number.set_value
+                data:
+                  entity_id: $micra_preinf_time
+                data_template:
+                  value: "{{ p }}"
+                variables:
+                  p: !lambda 'return id(preinf_time_val);'
+      - script.execute: paint_cfg
+      - script.execute: paint_main
 
   - id: cfg_act
     mode: restart
@@ -2014,12 +2315,13 @@ script:
           condition:
             lambda: |-
               return id(cfg_i) == 2 || id(cfg_i) == 3 || id(cfg_i) == 4
-                  || id(cfg_i) == 6;
+                  || id(cfg_i) == 5 || id(cfg_i) == 7 || id(cfg_i) == 8
+                  || id(cfg_i) == 9;
           then:
             - lambda: 'id(cfg_edit) = !id(cfg_edit);'
       - if:
           condition:
-            lambda: 'return id(cfg_i) == 5;'
+            lambda: 'return id(cfg_i) == 6;'
           then:
             - lambda: |-
                 int m = id(preinf_mode_val) + 1;
@@ -2040,7 +2342,7 @@ script:
                     }
       - if:
           condition:
-            lambda: 'return id(cfg_i) == 8;'
+            lambda: 'return id(cfg_i) == 11;'
           then:
             - lambda: 'id(cfg_edit) = false;'
             - script.execute: go_main
@@ -2153,9 +2455,41 @@ script:
                   return s;
       # Which beans are in the hopper. The value shown is whatever of the
       # HA option this display can actually draw -- see beans_hop_ascii.
+      # The grinder's recipe target can only be changed at the grinder, so
+      # this is the one way to aim at a different time from the machine
+      # side. Zero is not a time -- it means "no opinion, follow the recipe".
       - if:
           condition:
             lambda: 'return id(cfg_i) == 4;'
+          then:
+            - lvgl.label.update:
+                id: lbl_cfg_icon
+                text: "󰔛"
+            - lvgl.label.update:
+                id: lbl_cfg_name
+                text: "TARGET TIME"
+            - lvgl.label.update:
+                id: lbl_cfg_value
+                text_font: montserrat_48
+                text: !lambda |-
+                  static char b[12];
+                  if (id(tgt_time_val) < 0.5f) {
+                    snprintf(b, sizeof(b), "auto");
+                  } else {
+                    snprintf(b, sizeof(b), "%.0fs", id(tgt_time_val));
+                  }
+                  return b;
+            - lvgl.label.update:
+                id: lbl_cfg_hint
+                text: !lambda |-
+                  if (id(tgt_time_val) < 0.5f) {
+                    return std::string("following the grinder");
+                  }
+                  return id(cfg_edit) ? std::string("turn to set, tap to save")
+                                      : std::string("turn to 0 for auto");
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 5;'
           then:
             - lvgl.label.update:
                 id: lbl_cfg_icon
@@ -2170,15 +2504,16 @@ script:
             - lvgl.label.update:
                 id: lbl_cfg_hint
                 text: !lambda |-
-                  std::string s = id(cfg_edit) ? "turn to pick, tap to keep"
-                                               : "tap to change";
-                  return s;
+                  if (id(cfg_edit)) {
+                    return std::string("turn to pick, tap to keep");
+                  }
+                  return std::string("tap to change - HOLD to save");
       # Machine pre-infusion. Disabled / prebrew (pump pulses on-off-on) /
       # preinfusion (line pressure only, then the pump). The Micra exposes
       # them as one select, so this cycles rather than toggles.
       - if:
           condition:
-            lambda: 'return id(cfg_i) == 5;'
+            lambda: 'return id(cfg_i) == 6;'
           then:
             - lvgl.label.update:
                 id: lbl_cfg_icon
@@ -2203,7 +2538,7 @@ script:
       # unavailable. Show n/a rather than a stale figure.
       - if:
           condition:
-            lambda: 'return id(cfg_i) == 6;'
+            lambda: 'return id(cfg_i) == 7;'
           then:
             - lvgl.label.update:
                 id: lbl_cfg_icon
@@ -2230,9 +2565,72 @@ script:
                   }
                   return id(cfg_edit) ? std::string("turn to set, tap to save")
                                       : std::string("tap to adjust");
+      # The other half of pre-infusion. In prebrew the machine pulses the
+      # pump on-off-on instead of leaning on line pressure, and these two
+      # numbers are that pulse. They go unavailable in any other mode, which
+      # is why the card says which mode to pick rather than showing a stale
+      # figure -- the same treatment PRE-INF TIME gets.
       - if:
           condition:
-            lambda: 'return id(cfg_i) == 7;'
+            lambda: 'return id(cfg_i) == 8;'
+          then:
+            - lvgl.label.update:
+                id: lbl_cfg_icon
+                text: "󰖏"
+            - lvgl.label.update:
+                id: lbl_cfg_name
+                text: "PREBREW ON"
+            - lvgl.label.update:
+                id: lbl_cfg_value
+                text_font: montserrat_48
+                text: !lambda |-
+                  static char b[12];
+                  if (id(preinf_mode_val) != 1) {
+                    snprintf(b, sizeof(b), "n/a");
+                  } else {
+                    snprintf(b, sizeof(b), "%.1fs", id(prebrew_on_val));
+                  }
+                  return b;
+            - lvgl.label.update:
+                id: lbl_cfg_hint
+                text: !lambda |-
+                  if (id(preinf_mode_val) != 1) {
+                    return std::string("set mode to PREBREW");
+                  }
+                  return id(cfg_edit) ? std::string("turn to set, tap to save")
+                                      : std::string("tap to adjust");
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 9;'
+          then:
+            - lvgl.label.update:
+                id: lbl_cfg_icon
+                text: "󰖏"
+            - lvgl.label.update:
+                id: lbl_cfg_name
+                text: "PREBREW OFF"
+            - lvgl.label.update:
+                id: lbl_cfg_value
+                text_font: montserrat_48
+                text: !lambda |-
+                  static char b[12];
+                  if (id(preinf_mode_val) != 1) {
+                    snprintf(b, sizeof(b), "n/a");
+                  } else {
+                    snprintf(b, sizeof(b), "%.1fs", id(prebrew_off_val));
+                  }
+                  return b;
+            - lvgl.label.update:
+                id: lbl_cfg_hint
+                text: !lambda |-
+                  if (id(preinf_mode_val) != 1) {
+                    return std::string("set mode to PREBREW");
+                  }
+                  return id(cfg_edit) ? std::string("turn to set, tap to save")
+                                      : std::string("tap to adjust");
+      - if:
+          condition:
+            lambda: 'return id(cfg_i) == 10;'
           then:
             - lvgl.label.update:
                 id: lbl_cfg_icon
@@ -2249,7 +2647,7 @@ script:
                 text: "HOLD to start"
       - if:
           condition:
-            lambda: 'return id(cfg_i) == 8;'
+            lambda: 'return id(cfg_i) == 11;'
           then:
             - lvgl.label.update:
                 id: lbl_cfg_icon
@@ -2398,11 +2796,28 @@ script:
       - lvgl.label.update:
           id: lbl_res_grind
           text: !lambda |-
-            static char b[32];
+            static char b[48];
             int g = (int) id(sync_grind).state;
             int d = (int) id(grind_delta);
-            if (d == 0) snprintf(b, sizeof(b), "GRIND %d", g);
-            else snprintf(b, sizeof(b), "GRIND %d   %+d", g, d);
+            // The delta says what the grinder DID. This says what to do
+            // next, which is the part you would otherwise work out in your
+            // head: ran fast means the puck let go early, so grind finer.
+            const char *hint = "";
+            if (id(tgt_time_val) > 0.0f) {
+              float st = id(sync_time).state;
+              float tv = id(tgt_time_tol).state;
+              if (std::isnan(tv) || tv <= 0.0f) tv = 5.0f;
+              if (!std::isnan(st) && st > 0.0f) {
+                if (st < id(tgt_time_val) - tv) hint = "  finer";
+                else if (st > id(tgt_time_val) + tv) hint = "  coarser";
+              }
+            } else {
+              auto tq = id(mk_time_quality).state;
+              if (tq == "OFF_BELOW") hint = "  finer";
+              else if (tq == "OFF_ABOVE") hint = "  coarser";
+            }
+            if (d == 0) snprintf(b, sizeof(b), "GRIND %d%s", g, hint);
+            else snprintf(b, sizeof(b), "GRIND %d   %+d%s", g, d, hint);
             return b;
           text_color: !lambda |-
             uint32_t c = (id(grind_delta) != 0.0f) ? 0xC8913C : 0x6A6A6A;
@@ -2491,6 +2906,16 @@ script:
       - lvgl.arc.update:
           id: arc_shot
           value: !lambda 'return (float) id(shot_ds);'
+      # Same precedence as calc_verdict, so the arc and the verdict can never
+      # be aiming at different numbers.
+      - lvgl.arc.update:
+          id: arc_shot_tgt
+          value: !lambda |-
+            float ts = id(tgt_time_val);
+            if (ts <= 0.0f) ts = id(mk_time_target).state;
+            if (std::isnan(ts) || ts <= 0.0f) ts = id(tgt_time).state;
+            if (std::isnan(ts) || ts <= 0.0f) ts = 25.0f;
+            return ts * 10.0f;
 
   # The wait for the Sync bundle is the one moment the knob depends on
   # somebody else's timing, so it says so out loud. The subtitle under the
@@ -2660,6 +3085,16 @@ lvgl:
             text_color: 0x707070
             align: CENTER
             y: 34
+        # Sits between the last-shot line and the buttons. Empty most of
+        # the time, which is the point: if there is text here, something is
+        # owed.
+        - label:
+            id: lbl_main_care
+            text: ""
+            text_font: montserrat_16
+            text_color: 0xB0823A
+            align: CENTER
+            y: 54
         - button:
             id: btn_power
             align: CENTER
@@ -2717,18 +3152,27 @@ lvgl:
       on_long_press:
         - if:
             condition:
-              lambda: 'return id(cfg_i) == 7;'
+              lambda: 'return id(cfg_i) == 10;'
             then:
               - logger.log: "CFG: starting backflush"
               # Everything about arming lives in start_clean, including the
               # wake-from-standby step -- the page should not know the order.
               - script.execute: start_clean
             else:
-              - script.execute:
-                  id: haptic
-                  effect: 1
-              - lambda: 'id(cfg_edit) = false;'
-              - script.execute: go_main
+              - if:
+                  condition:
+                    lambda: 'return id(cfg_i) == 5;'
+                  then:
+                    # Holding on the beans item writes the machine settings
+                    # that are on screen right now into the slot for the
+                    # grinder's current recipe. Nothing to navigate to.
+                    - script.execute: preset_save
+                  else:
+                    - script.execute:
+                        id: haptic
+                        effect: 1
+                    - lambda: 'id(cfg_edit) = false;'
+                    - script.execute: go_main
       widgets:
         - obj:
             id: ring_cfg
@@ -3099,6 +3543,26 @@ lvgl:
       on_long_press:
         - script.execute: go_main
       widgets:
+        # Two arcs stacked, and the gap between them IS the feature. The one
+        # underneath fills to the target time in dim green; the red one on
+        # top fills to elapsed and carries no track of its own, so the green
+        # still showing past the red is exactly the time left. Watch it close.
+        - arc:
+            id: arc_shot_tgt
+            align: CENTER
+            width: 344
+            height: 344
+            start_angle: 270
+            end_angle: 268
+            min_value: 0
+            max_value: $shot_full_scale_ds
+            value: 0
+            adjustable: false
+            arc_width: 14
+            arc_color: 0x2A0A0C
+            indicator:
+              arc_width: 14
+              arc_color: 0x1F5B2A
         - arc:
             id: arc_shot
             align: CENTER
@@ -3111,7 +3575,7 @@ lvgl:
             value: 0
             adjustable: false
             arc_width: 14
-            arc_color: 0x2A0A0C
+            arc_opa: TRANSP
             indicator:
               arc_width: 14
               arc_color: 0xE31E24
