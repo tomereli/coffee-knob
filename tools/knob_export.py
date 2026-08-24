@@ -82,8 +82,10 @@ def main(path):
         for kind, spec, parent in widgets_of(pg):
             e = {'k': kind, 'id': spec.get('id'),
                  'x': spec.get('x', 0) or 0, 'y': spec.get('y', 0) or 0}
-            if parent is not None and parent.get('id'):
-                e['in'] = parent['id']
+            if parent is not None:
+                e['in'] = parent.get('id') or 1
+                e['x'] += parent.get('x', 0) or 0
+                e['y'] += parent.get('y', 0) or 0
             if kind == 'label':
                 e['f'] = FONT_PX.get(spec.get('text_font', 'montserrat_16'), 16)
                 e['c'] = col(spec.get('text_color')) or '#FFFFFF'

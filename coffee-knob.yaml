@@ -1785,9 +1785,28 @@ script:
               }
             }
           }
+      # One line, three states, in priority order. Below the ready ETA it
+      # carries the backflush warning, which used to have a slot of its own
+      # at y=54 -- entirely underneath the two 78px buttons at y=86, so it
+      # was never once visible on the glass.
       - lvgl.label.update:
           id: lbl_main_ready
-          text: !lambda 'return id(ready_txt);'
+          text: !lambda |-
+            if (!id(ready_txt).empty()) return id(ready_txt);
+            int h = id(clean_age_h);
+            int n = id(shots_since_clean);
+            if ((h >= 48) || (n >= $clean_due_shots))
+              return std::string("backflush due");
+            if ((h >= 24) || (n >= $clean_warn_shots))
+              return std::string("backflush soon");
+            return std::string("");
+          text_color: !lambda |-
+            if (!id(ready_txt).empty()) return lv_color_hex(0xFF9A4A);
+            int h = id(clean_age_h);
+            int n = id(shots_since_clean);
+            if ((h >= 48) || (n >= $clean_due_shots))
+              return lv_color_hex(0xE31E24);
+            return lv_color_hex(0xB0823A);
       - lvgl.label.update:
           id: lbl_state
           text: !lambda |-
@@ -1798,26 +1817,6 @@ script:
           id: ring
           border_color: !lambda 'return lv_color_hex(id(main_ring_c));'
           border_width: 6
-      # Hours and shots are two different ways of being dirty -- a quiet day
-      # and a heavy one are not the same. Whichever crosses first wins, and
-      # the main card is where it has to show, because the CARE card is a
-      # place you only go when you already suspect something.
-      - lvgl.label.update:
-          id: lbl_main_care
-          text: !lambda |-
-            int h = id(clean_age_h);
-            int n = id(shots_since_clean);
-            bool due  = (h >= 48) || (n >= $clean_due_shots);
-            bool soon = (h >= 24) || (n >= $clean_warn_shots);
-            if (due)  return std::string("backflush due");
-            if (soon) return std::string("backflush soon");
-            return std::string("");
-          text_color: !lambda |-
-            int h = id(clean_age_h);
-            int n = id(shots_since_clean);
-            if ((h >= 48) || (n >= $clean_due_shots))
-              return lv_color_hex(0xE31E24);
-            return lv_color_hex(0xB0823A);
       - lvgl.label.update:
           id: lbl_last
           text: !lambda |-
@@ -2368,9 +2367,15 @@ script:
       - if:
           condition:
             lambda: |-
-              return id(cfg_i) == 2 || id(cfg_i) == 3 || id(cfg_i) == 4
-                  || id(cfg_i) == 5 || id(cfg_i) == 7 || id(cfg_i) == 8
-                  || id(cfg_i) == 9;
+              // Never open an edit on a value the machine is not using. The
+              // three pre-infusion timings go unavailable outside their own
+              // mode, and tapping one used to turn the ring white over a
+              // screen reading n/a -- after which turning pushed
+              // number.set_value at an unavailable entity.
+              int i = id(cfg_i);
+              if (i == 7) return id(preinf_mode_val) == 2;
+              if (i == 8 || i == 9) return id(preinf_mode_val) == 1;
+              return i == 2 || i == 3 || i == 4 || i == 5;
           then:
             - lambda: 'id(cfg_edit) = !id(cfg_edit);'
       - if:
@@ -3147,16 +3152,6 @@ lvgl:
             text_color: 0x707070
             align: CENTER
             y: 34
-        # Sits between the last-shot line and the buttons. Empty most of
-        # the time, which is the point: if there is text here, something is
-        # owed.
-        - label:
-            id: lbl_main_care
-            text: ""
-            text_font: montserrat_16
-            text_color: 0xB0823A
-            align: CENTER
-            y: 54
         - button:
             id: btn_power
             align: CENTER

@@ -109,6 +109,24 @@ the user's own 4- and 5-star shots occupy, segmented by bean and by serve --
 turning "did you hit the number you guessed" into "was this like the cups you
 liked". Not built yet; it is the highest-value idea on the list.
 
+## The preview pipeline
+
+    python tools/knob_lint.py coffee-knob.yaml          # geometry, fails loudly
+    python tools/knob_export.py coffee-knob.yaml > tools/layout.json
+    python tools/build_sim.py tools/layout.json knob-sim.html
+    python tools/knob_shots.py knob-sim.html shots/     # drives Chromium, shoots every screen
+
+`knob_shots.py` walks 22 screens, reports any label that overflows and any
+console error, and writes a PNG of each. Look at the PNGs. Two defects
+reached the user's hands because this step did not exist: a settings menu
+whose rim labels were cut mid-word, and an icon font blocked by the artifact
+CSP so every glyph drew as an empty square.
+
+Artifacts load fonts from Google Fonts and **nothing else** -- a CDN
+stylesheet is silently blocked. The simulator therefore draws Material
+Symbols chosen to mean the same thing as each MDI glyph. Artwork differs from
+the device; position and size, which is what a layout is judged on, do not.
+
 ## Verify before you act on a review
 
 Findings from a review -- human or agent -- get checked against the code

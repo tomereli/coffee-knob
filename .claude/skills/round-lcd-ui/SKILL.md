@@ -89,6 +89,35 @@ first press of the day lands on a screen the user cannot read, and without a
 guard it activates whatever is under the finger. Stamp the moment the
 backlight comes up and ignore input for a few hundred milliseconds after it.
 
+## Three checks, and none of them substitutes for another
+
+They fail differently, which is the point. Every regression on this project
+got past two of them because only one was run.
+
+**Geometry lint** -- reads the config, computes the chord at each label's
+height, fails on text that cannot fit, on a glyph missing from the font's
+list, and on a label sitting behind an opaque widget. Catches what is
+computable. Blind to anything about behaviour or rendering.
+
+**A subagent reading the source** -- give it the simulator and the firmware
+config and ask where they disagree. One pass found twenty behavioural
+mismatches: a gesture bound to one action in the simulator and three in the
+firmware, rotation that adjusts a value on the device and does nothing in the
+mock, a ring that carries a verdict colour on the glass and a fixed colour in
+the preview. It cannot see anything that only exists in pixels.
+
+**A browser, driven, screenshotted, looked at** -- load the page, click the
+real controls, photograph each screen, and *look at the images*. This is the
+only check that finds a font that failed to load, a CSS rule losing to a more
+specific one, or a glyph rendering as a tofu box. All three of those shipped
+past the other two checks in a single afternoon.
+
+**A checking tool is broken until it has been demonstrated against a known
+failure.** The geometry lint reported "0 errors" on the exact layout that had
+just been photographed as broken, and took three attempts to become useful.
+Run any new check against the last thing that actually went wrong; if it
+passes that, it is decoration.
+
 ## Process for any layout change
 
 1. Change the config.
@@ -97,7 +126,9 @@ backlight comes up and ignore input for a few hundred milliseconds after it.
 3. Render the affected pages **including their ugly states** -- longest
    possible string, unavailable data, the mode that makes an item read
    "n/a". A mock of the happy path is the same lie as a drawing.
-4. Look at the render yourself. If you have not looked, you have not checked.
+4. Drive it in a browser and look at the screenshots yourself. Reading the
+   source is not looking; a subagent auditing the JavaScript found twenty
+   real defects and could not see that every icon on the page was a tofu box.
 5. Show it to the user and get a yes.
 6. Only then flash.
 

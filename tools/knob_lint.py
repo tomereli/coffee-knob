@@ -141,6 +141,19 @@ def main(path):
 
     errors, warnings, checked = [], [], 0
 
+    # Opaque things a label can end up behind. A button has a background, so
+    # a label sharing its box is not dimmed or overlapped -- it is invisible.
+    # lbl_main_care sat at y=54 spanning +46..+62 with two 78px buttons at
+    # y=86 spanning +47..+125, and "backflush due" was never once drawn where
+    # a person could see it.
+    solids = {}
+    for page, kind, spec in collect(cfg):
+        if kind in ('button', 'obj') and spec.get('bg_color') is not None:
+            solids.setdefault(page, []).append(
+                (spec.get('id', '(anon)'), spec.get('x', 0) or 0,
+                 spec.get('y', 0) or 0, spec.get('width', 0),
+                 spec.get('height', 0)))
+
     for page, kind, spec in collect(cfg):
         if kind != 'label':
             continue
@@ -183,6 +196,13 @@ def main(path):
             txt = str(spec.get('text', ''))
             font = declared_font
             w, h = text_width(txt, font), text_height(font)
+
+        for sid, sx, sy, sw, sh in solids.get(page, []):
+            if (abs(y - sy) < (h + sh) / 2 and abs(x - sx) < (w + sw) / 2):
+                errors.append(
+                    '%s/%s at (%+d,%+d) is behind %s, which is opaque and '
+                    'spans %+d..%+d vertically -- the label is invisible'
+                    % (page, wid, x, y, sid, sy - sh // 2, sy + sh // 2))
 
         ok, over = fits(x, y, w, h)
         if not ok:
