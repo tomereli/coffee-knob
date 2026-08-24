@@ -17,3 +17,9 @@ MAHLKONIG-TASK-BRIEF.md
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Simulator build output (regenerate with tools/build_sim.py)
+knob-sim.html
+mock.png
+__pycache__/
+*.pyc

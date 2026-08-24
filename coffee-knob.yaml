@@ -1279,55 +1279,36 @@ script:
   - id: show_card
     mode: restart
     then:
-      # Paint before show, then slide in the direction the knob turned. The
-      # carousel used to snap between cards with no sense of travel, which
-      # is what made five cards feel like five unrelated screens instead of
-      # one strip you are moving along.
       - if:
           condition:
             lambda: 'return id(card_i) == 0;'
           then:
             - script.execute: paint_main
-            - lvgl.page.show:
-                id: page_main
-                animation: MOVE_RIGHT
-                time: 180ms
+            - lvgl.page.show: page_main
       - if:
           condition:
             lambda: 'return id(card_i) == 1;'
           then:
             - script.execute: paint_result
-            - lvgl.page.show:
-                id: page_result
-                animation: MOVE_LEFT
-                time: 180ms
+            - lvgl.page.show: page_result
       - if:
           condition:
             lambda: 'return id(card_i) == 2;'
           then:
             - script.execute: paint_grind
-            - lvgl.page.show:
-                id: page_grind
-                animation: MOVE_LEFT
-                time: 180ms
+            - lvgl.page.show: page_grind
       - if:
           condition:
             lambda: 'return id(card_i) == 3;'
           then:
             - script.execute: paint_care
-            - lvgl.page.show:
-                id: page_care
-                animation: MOVE_LEFT
-                time: 180ms
+            - lvgl.page.show: page_care
       - if:
           condition:
             lambda: 'return id(card_i) == 4;'
           then:
             - script.execute: paint_boil
-            - lvgl.page.show:
-                id: page_boil
-                animation: MOVE_LEFT
-                time: 180ms
+            - lvgl.page.show: page_boil
 
   # Both the machine and the grinder report ISO-8601 UTC timestamps. Turn
   # them into "3h ago" once, here, instead of in every label lambda.
@@ -2981,16 +2962,6 @@ script:
       - lvgl.arc.update:
           id: arc_shot
           value: !lambda 'return (float) id(shot_ds);'
-      # Same precedence as calc_verdict, so the arc and the verdict can never
-      # be aiming at different numbers.
-      - lvgl.arc.update:
-          id: arc_shot_tgt
-          value: !lambda |-
-            float ts = id(tgt_time_val);
-            if (ts <= 0.0f) ts = id(mk_time_target).state;
-            if (std::isnan(ts) || ts <= 0.0f) ts = id(tgt_time).state;
-            if (std::isnan(ts) || ts <= 0.0f) ts = 25.0f;
-            return ts * 10.0f;
 
   # The wait for the Sync bundle is the one moment the knob depends on
   # somebody else's timing, so it says so out loud. The subtitle under the
@@ -3650,26 +3621,6 @@ lvgl:
       on_long_press:
         - script.execute: go_main
       widgets:
-        # Two arcs stacked, and the gap between them IS the feature. The one
-        # underneath fills to the target time in dim green; the red one on
-        # top fills to elapsed and carries no track of its own, so the green
-        # still showing past the red is exactly the time left. Watch it close.
-        - arc:
-            id: arc_shot_tgt
-            align: CENTER
-            width: 344
-            height: 344
-            start_angle: 270
-            end_angle: 268
-            min_value: 0
-            max_value: $shot_full_scale_ds
-            value: 0
-            adjustable: false
-            arc_width: 14
-            arc_color: 0x2A0A0C
-            indicator:
-              arc_width: 14
-              arc_color: 0x1F5B2A
         - arc:
             id: arc_shot
             align: CENTER
@@ -3682,7 +3633,7 @@ lvgl:
             value: 0
             adjustable: false
             arc_width: 14
-            arc_opa: TRANSP
+            arc_color: 0x2A0A0C
             indicator:
               arc_width: 14
               arc_color: 0xE31E24
