@@ -921,6 +921,41 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'false'
+  # Which field of a multi-field item is being turned. Only PRE-INFUSION
+  # uses it: 0 = mode, 1 = first time, 2 = second time (prebrew only).
+  - id: cfg_sub
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Backflush is the one irreversible thing on this page, so it is the one
+  # thing that takes two deliberate taps. Cleared by leaving the sector.
+  - id: clean_armed
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # Steam is one item now: 0 = boiler off, 1-3 = boiler on at that level.
+  - id: steam_sel
+    type: int
+    restore_value: false
+    initial_value: '2'
+  # The three centre strings, computed once per paint instead of by twelve
+  # branches of label lambdas.
+  - id: cfg_name
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: cfg_val
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: cfg_hint
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: cfg_val_c
+    type: uint32_t
+    restore_value: false
+    initial_value: '0xFFFFFF'
   - id: steam_level_val
     type: int
     restore_value: false
@@ -2075,63 +2110,72 @@ script:
   - id: cfg_move
     parameters:
       delta: int
-    mode: parallel
-    max_runs: 8
+    mode: restart
     then:
       - script.execute:
           id: haptic
           effect: 7
       - light.turn_on: back_light
       - script.execute: screentime
-      # cfg_edit alone is no longer enough to say WHAT is being edited, now
-      # that two items are editable. cfg_i cannot change while cfg_edit is
-      # true (turning adjusts the value instead of moving), so the pair is
-      # unambiguous.
+      # Leaving a sector disarms it. Arming has to be a thing you are
+      # looking at, not a state you left behind two detents ago.
       - lambda: |-
-          if (id(cfg_edit) && id(cfg_i) == 2) {
+          if (!id(cfg_edit)) id(clean_armed) = false;
+      - lambda: |-
+          if (!id(cfg_edit)) {
+            // EIGHT sectors. Renumbering means touching cfg_move, cfg_act
+            // and paint_cfg -- page_cfg no longer branches on the index.
+            const int n = 8;
+            id(cfg_i) = ((id(cfg_i) + delta) % n + n) % n;
+            id(cfg_sub) = 0;
+          } else if (id(cfg_i) == 1) {
+            int v = id(steam_sel) + delta;
+            if (v < 0) v = 0;
+            if (v > 3) v = 3;
+            id(steam_sel) = v;
+          } else if (id(cfg_i) == 2) {
             float t = id(coffee_temp_val) + 0.5f * delta;
-            if (t < 85.0f) t = 85.0f;
+            if (t < 85.0f)  t = 85.0f;
             if (t > 104.0f) t = 104.0f;
             id(coffee_temp_val) = t;
-          } else if (id(cfg_edit) && id(cfg_i) == 3) {
+          } else if (id(cfg_i) == 3) {
             float r = id(ratio_val) + 0.05f * delta;
             if (r < 1.20f) r = 1.20f;
             if (r > 3.00f) r = 3.00f;
             id(ratio_val) = r;
-          } else if (id(cfg_edit) && id(cfg_i) == 4) {
-            // Whole seconds: the grinder's own target is a whole number, and
-            // half-second precision on a shot target is false accuracy.
+          } else if (id(cfg_i) == 4) {
             float t = id(tgt_time_val) + 1.0f * delta;
             if (t < 0.0f)  t = 0.0f;
             if (t > 45.0f) t = 45.0f;
             id(tgt_time_val) = t;
-          } else if (id(cfg_edit) && id(cfg_i) == 5) {
-            // Beans have no local value to hold: the option list lives in
-            // Home Assistant and the knob never sees it. Home Assistant's
-            // own select_next / select_previous do the walking, fired from
-            // the actions below -- so this branch exists only to stop the
-            // cursor sliding off the item while it is being edited.
-          } else if (id(cfg_edit) && id(cfg_i) == 7) {
-            float p = id(preinf_time_val) + 0.5f * delta;
-            if (p < 0.0f)  p = 0.0f;
-            if (p > 30.0f) p = 30.0f;
-            id(preinf_time_val) = p;
-          } else if (id(cfg_edit) && id(cfg_i) == 8) {
-            float p = id(prebrew_on_val) + 0.1f * delta;
-            if (p < 0.0f)  p = 0.0f;
-            if (p > 30.0f) p = 30.0f;
-            id(prebrew_on_val) = p;
-          } else if (id(cfg_edit) && id(cfg_i) == 9) {
-            float p = id(prebrew_off_val) + 0.1f * delta;
-            if (p < 0.0f)  p = 0.0f;
-            if (p > 30.0f) p = 30.0f;
-            id(prebrew_off_val) = p;
-          } else {
-            // TWELVE items now. Renumbering this list means touching four
-            // places: here, cfg_act, paint_cfg, and page_cfg's on_long_press.
-            const int n = 12;
-            id(cfg_i) = ((id(cfg_i) + delta) % n + n) % n;
+          } else if (id(cfg_i) == 7) {
+            if (id(cfg_sub) == 0) {
+              int m = id(preinf_mode_val) + delta;
+              if (m < 0) m = 0;
+              if (m > 2) m = 2;
+              id(preinf_mode_val) = m;
+            } else if (id(preinf_mode_val) == 2) {
+              float v = id(preinf_time_val) + 0.5f * delta;
+              if (v < 0.0f)  v = 0.0f;
+              if (v > 30.0f) v = 30.0f;
+              id(preinf_time_val) = v;
+            } else if (id(cfg_sub) == 1) {
+              float v = id(prebrew_on_val) + 0.1f * delta;
+              if (v < 0.0f)  v = 0.0f;
+              if (v > 30.0f) v = 30.0f;
+              id(prebrew_on_val) = v;
+            } else {
+              float v = id(prebrew_off_val) + 0.1f * delta;
+              if (v < 0.0f)  v = 0.0f;
+              if (v > 30.0f) v = 30.0f;
+              id(prebrew_off_val) = v;
+            }
           }
+      - if:
+          condition:
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 1;'
+          then:
+            - script.execute: push_steam
       - if:
           condition:
             lambda: 'return id(cfg_edit) && id(cfg_i) == 2;'
@@ -2142,17 +2186,16 @@ script:
             lambda: 'return id(cfg_edit) && id(cfg_i) == 3;'
           then:
             - script.execute: push_ratio
-      # No debounce on these two: an input_select has no intermediate values
-      # to spam, each detent is one discrete option, and HA is the only thing
-      # that knows how many there are.
       - if:
           condition:
             lambda: 'return id(cfg_edit) && id(cfg_i) == 4;'
           then:
             - script.execute: push_tgt_time
+      # Beans hold no local value: the list lives in Home Assistant and the
+      # knob never sees it, so HA does the walking.
       - if:
           condition:
-            lambda: 'return id(cfg_edit) && id(cfg_i) == 5 && delta > 0;'
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 6 && delta > 0;'
           then:
             - homeassistant.action:
                 action: input_select.select_next
@@ -2161,7 +2204,7 @@ script:
                   cycle: "true"
       - if:
           condition:
-            lambda: 'return id(cfg_edit) && id(cfg_i) == 5 && delta < 0;'
+            lambda: 'return id(cfg_edit) && id(cfg_i) == 6 && delta < 0;'
           then:
             - homeassistant.action:
                 action: input_select.select_previous
@@ -2172,25 +2215,13 @@ script:
           condition:
             lambda: 'return id(cfg_edit) && id(cfg_i) == 7;'
           then:
-            - script.execute: push_preinf
-      - if:
-          condition:
-            lambda: 'return id(cfg_edit) && id(cfg_i) == 8;'
-          then:
-            - script.execute: push_prebrew_on
-      - if:
-          condition:
-            lambda: 'return id(cfg_edit) && id(cfg_i) == 9;'
-          then:
-            - script.execute: push_prebrew_off
+            - script.execute: push_preinf_all
       - script.execute: paint_cfg
-
-  # Debounced: only sends once the knob stops, so a fast spin does not fire
-  # twenty service calls at Home Assistant.
   - id: push_temp
     mode: restart
     then:
       - delay: 600ms
+      - script.execute: preset_store
       - homeassistant.action:
           action: number.set_value
           data:
@@ -2205,6 +2236,7 @@ script:
     mode: restart
     then:
       - delay: 600ms
+      - script.execute: preset_store
       - homeassistant.action:
           action: input_number.set_value
           data:
@@ -2214,44 +2246,99 @@ script:
           variables:
             r: !lambda 'return id(ratio_val);'
 
-  - id: push_preinf
+  # Steam is one control: 0 turns the boiler off, 1-3 turn it on and set the
+  # level. Two items for one decision was two detents for no reason.
+  - id: push_steam
     mode: restart
     then:
       - delay: 600ms
-      - homeassistant.action:
-          action: number.set_value
-          data:
-            entity_id: $micra_preinf_time
-          data_template:
-            value: "{{ p }}"
-          variables:
-            p: !lambda 'return id(preinf_time_val);'
+      - if:
+          condition:
+            lambda: 'return id(steam_sel) == 0;'
+          then:
+            - homeassistant.action:
+                action: switch.turn_off
+                data:
+                  entity_id: $micra_steam
+          else:
+            - homeassistant.action:
+                action: switch.turn_on
+                data:
+                  entity_id: $micra_steam
+            - homeassistant.action:
+                action: select.select_option
+                data:
+                  entity_id: $micra_steam_level
+                data_template:
+                  option: "{{ lv }}"
+                variables:
+                  lv: !lambda 'return id(steam_sel);'
 
-  - id: push_prebrew_on
+  # Mode and both timings travel together: changing mode without pushing the
+  # time that belongs to it leaves the machine half-configured.
+  - id: push_preinf_all
     mode: restart
     then:
       - delay: 600ms
       - homeassistant.action:
-          action: number.set_value
+          action: select.select_option
           data:
-            entity_id: $micra_prebrew_on
+            entity_id: $micra_preinf_mode
           data_template:
-            value: "{{ p }}"
+            option: "{{ opt }}"
           variables:
-            p: !lambda 'return id(prebrew_on_val);'
+            opt: !lambda |-
+              switch (id(preinf_mode_val)) {
+                case 0:  return std::string("disabled");
+                case 1:  return std::string("prebrew");
+                default: return std::string("preinfusion");
+              }
+      - if:
+          condition:
+            lambda: 'return id(preinf_mode_val) == 2;'
+          then:
+            - homeassistant.action:
+                action: number.set_value
+                data:
+                  entity_id: $micra_preinf_time
+                data_template:
+                  value: "{{ p }}"
+                variables:
+                  p: !lambda 'return id(preinf_time_val);'
+      - if:
+          condition:
+            lambda: 'return id(preinf_mode_val) == 1;'
+          then:
+            - homeassistant.action:
+                action: number.set_value
+                data:
+                  entity_id: $micra_prebrew_on
+                data_template:
+                  value: "{{ p }}"
+                variables:
+                  p: !lambda 'return id(prebrew_on_val);'
+            - homeassistant.action:
+                action: number.set_value
+                data:
+                  entity_id: $micra_prebrew_off
+                data_template:
+                  value: "{{ p }}"
+                variables:
+                  p: !lambda 'return id(prebrew_off_val);'
+      - script.execute: preset_store
 
-  - id: push_prebrew_off
+  # Presets are no longer a hidden gesture. Anything you dial in is written
+  # to the slot for the grinder's current recipe as a matter of course, and
+  # read back when that recipe is loaded again.
+  - id: preset_store
     mode: restart
     then:
-      - delay: 600ms
-      - homeassistant.action:
-          action: number.set_value
-          data:
-            entity_id: $micra_prebrew_off
-          data_template:
-            value: "{{ p }}"
-          variables:
-            p: !lambda 'return id(prebrew_off_val);'
+      - lambda: |-
+          int i = id(recipe_i);
+          if (i < 0 || i > 2) return;
+          id(preset_temp)[i]   = id(coffee_temp_val);
+          id(preset_ratio)[i]  = id(ratio_val);
+          id(preset_preinf)[i] = id(preinf_time_val);
 
   - id: push_tgt_time
     mode: restart
@@ -2267,31 +2354,11 @@ script:
             t: !lambda 'return id(tgt_time_val);'
 
   # --- Per-recipe presets -------------------------------------------------
-  # The grinder holds three cloud recipes and reports only WHICH one is
-  # loaded -- there is no name, and the app has no rename. Switching recipe
-  # is already how a different bag gets dialled in, so that index is the
-  # natural key for "the machine settings that belong with these beans".
-  # Saving is a HOLD on the BEANS item; applying happens by itself when the
-  # grinder reports a different recipe.
-  - id: preset_save
-    mode: restart
-    then:
-      - script.execute:
-          id: haptic
-          effect: 1
-      - lambda: |-
-          int i = id(recipe_i);
-          if (i < 0 || i > 2) return;
-          id(preset_temp)[i]   = id(coffee_temp_val);
-          id(preset_ratio)[i]  = id(ratio_val);
-          id(preset_preinf)[i] = id(preinf_time_val);
-          ESP_LOGI("preset", "saved slot %d: %.1fC 1:%.2f %.1fs", i,
-                   id(coffee_temp_val), id(ratio_val), id(preinf_time_val));
-      - script.execute: paint_cfg
+  # Keyed on the grinder recipe index, the only handle it gives: the app has
+  # no rename and the integration reports no name. Written by preset_store
+  # whenever anything is dialled in, read back when that recipe is loaded.
+  # No gesture to remember, nothing hidden behind a hold.
 
-  # A slot left at 0 was never saved, so applying it would push nonsense at
-  # the machine. Each field is guarded on its own -- a half-filled slot is
-  # still worth the half it has.
   - id: preset_apply
     mode: restart
     then:
@@ -2350,393 +2417,224 @@ script:
       - script.execute:
           id: haptic
           effect: 1
+      # EXIT
       - if:
           condition:
             lambda: 'return id(cfg_i) == 0;'
           then:
-            # Absolute, not a toggle -- same staleness trap as power_press.
-            - if:
-                condition:
-                  lambda: 'return !id(steam_on).state;'
-                then:
-                  - homeassistant.action:
-                      action: switch.turn_on
-                      data:
-                        entity_id: $micra_steam
-                else:
-                  - homeassistant.action:
-                      action: switch.turn_off
-                      data:
-                        entity_id: $micra_steam
-      - if:
-          condition:
-            lambda: 'return id(cfg_i) == 1;'
-          then:
             - lambda: |-
-                int lv = id(steam_level_val) + 1;
-                if (lv > 3) lv = 1;
-                id(steam_level_val) = lv;
-            - homeassistant.action:
-                action: select.select_option
-                data:
-                  entity_id: $micra_steam_level
-                data_template:
-                  option: "{{ lv }}"
-                variables:
-                  lv: !lambda 'return id(steam_level_val);'
-      - if:
-          condition:
-            lambda: |-
-              return id(cfg_i) == 2 || id(cfg_i) == 3 || id(cfg_i) == 4
-                  || id(cfg_i) == 5 || id(cfg_i) == 7 || id(cfg_i) == 8
-                  || id(cfg_i) == 9;
-          then:
-            - lambda: 'id(cfg_edit) = !id(cfg_edit);'
-      - if:
-          condition:
-            lambda: 'return id(cfg_i) == 6;'
-          then:
-            - lambda: |-
-                int m = id(preinf_mode_val) + 1;
-                if (m > 2) m = 0;
-                id(preinf_mode_val) = m;
-            - homeassistant.action:
-                action: select.select_option
-                data:
-                  entity_id: $micra_preinf_mode
-                data_template:
-                  option: "{{ opt }}"
-                variables:
-                  opt: !lambda |-
-                    switch (id(preinf_mode_val)) {
-                      case 0:  return std::string("disabled");
-                      case 1:  return std::string("prebrew");
-                      default: return std::string("preinfusion");
-                    }
-      - if:
-          condition:
-            lambda: 'return id(cfg_i) == 11;'
-          then:
-            - lambda: 'id(cfg_edit) = false;'
+                id(cfg_edit) = false;
+                id(clean_armed) = false;
             - script.execute: go_main
-      - script.execute: paint_cfg
-
-  - id: paint_cfg
-    mode: restart
-    then:
-      - if:
-          condition:
-            lambda: 'return id(cfg_edit);'
-          then:
-            - lvgl.widget.update:
-                id: ring_cfg
-                border_color: 0xFFFFFF
-                border_width: 10
-          else:
-            - lvgl.widget.update:
-                id: ring_cfg
-                border_color: 0xE31E24
-                border_width: 6
-      - if:
-          condition:
-            lambda: 'return id(cfg_i) == 0;'
-          then:
-            - lvgl.label.update:
-                id: lbl_cfg_icon
-                text: "󱌙"
-            - lvgl.label.update:
-                id: lbl_cfg_name
-                text: "STEAM BOILER"
-            - lvgl.label.update:
-                id: lbl_cfg_value
-                text_font: montserrat_48
-                text: !lambda |-
-                  std::string s = id(steam_on).state ? "ON" : "OFF";
-                  return s;
-            - lvgl.label.update:
-                id: lbl_cfg_hint
-                text: "tap to toggle"
-      - if:
-          condition:
-            lambda: 'return id(cfg_i) == 1;'
-          then:
-            - lvgl.label.update:
-                id: lbl_cfg_icon
-                text: "󰓓"
-            - lvgl.label.update:
-                id: lbl_cfg_name
-                text: "STEAM LEVEL"
-            - lvgl.label.update:
-                id: lbl_cfg_value
-                text_font: montserrat_48
-                text: !lambda |-
-                  static char b[4];
-                  snprintf(b, sizeof(b), "%d", id(steam_level_val));
-                  return b;
-            - lvgl.label.update:
-                id: lbl_cfg_hint
-                text: "tap to cycle 1-3"
-      - if:
-          condition:
-            lambda: 'return id(cfg_i) == 2;'
-          then:
-            - lvgl.label.update:
-                id: lbl_cfg_icon
-                text: "󰔏"
-            - lvgl.label.update:
-                id: lbl_cfg_name
-                text: "COFFEE TEMP"
-            - lvgl.label.update:
-                id: lbl_cfg_value
-                text_font: montserrat_48
-                text: !lambda |-
-                  static char b[10];
-                  snprintf(b, sizeof(b), "%.1f", id(coffee_temp_val));
-                  return b;
-            - lvgl.label.update:
-                id: lbl_cfg_hint
-                text: !lambda |-
-                  std::string s = id(cfg_edit) ? "turn to set, tap to save"
-                                               : "tap to adjust";
-                  return s;
-      # The one number on this page that is a matter of taste rather than a
-      # machine setting -- and the reason a 1:1.72 shot was showing a red
-      # ring. Editable here so it can be corrected standing at the machine,
-      # right after tasting, which is the only moment you actually know.
-      - if:
-          condition:
-            lambda: 'return id(cfg_i) == 3;'
-          then:
-            - lvgl.label.update:
-                id: lbl_cfg_icon
-                text: "󰗑"
-            - lvgl.label.update:
-                id: lbl_cfg_name
-                text: "TARGET RATIO"
-            - lvgl.label.update:
-                id: lbl_cfg_value
-                text_font: montserrat_48
-                text: !lambda |-
-                  static char b[12];
-                  snprintf(b, sizeof(b), "1:%.2f", id(ratio_val));
-                  return b;
-            - lvgl.label.update:
-                id: lbl_cfg_hint
-                text: !lambda |-
-                  std::string s = id(cfg_edit) ? "turn to set, tap to save"
-                                               : "tap to adjust";
-                  return s;
-      # Which beans are in the hopper. The value shown is whatever of the
-      # HA option this display can actually draw -- see beans_hop_ascii.
-      # The grinder's recipe target can only be changed at the grinder, so
-      # this is the one way to aim at a different time from the machine
-      # side. Zero is not a time -- it means "no opinion, follow the recipe".
-      - if:
-          condition:
-            lambda: 'return id(cfg_i) == 4;'
-          then:
-            - lvgl.label.update:
-                id: lbl_cfg_icon
-                text: "󰔛"
-            - lvgl.label.update:
-                id: lbl_cfg_name
-                text: "TARGET TIME"
-            - lvgl.label.update:
-                id: lbl_cfg_value
-                text_font: montserrat_48
-                text: !lambda |-
-                  static char b[12];
-                  if (id(tgt_time_val) < 0.5f) {
-                    snprintf(b, sizeof(b), "auto");
-                  } else {
-                    snprintf(b, sizeof(b), "%.0fs", id(tgt_time_val));
-                  }
-                  return b;
-            - lvgl.label.update:
-                id: lbl_cfg_hint
-                text: !lambda |-
-                  if (id(tgt_time_val) < 0.5f) {
-                    return std::string("following the grinder");
-                  }
-                  return id(cfg_edit) ? std::string("turn to set, tap to save")
-                                      : std::string("turn to 0 for auto");
+      # BACKFLUSH: arm, then fire. Two deliberate taps on the sector you are
+      # looking at, instead of a hold that means "leave" everywhere else.
       - if:
           condition:
             lambda: 'return id(cfg_i) == 5;'
           then:
-            - lvgl.label.update:
-                id: lbl_cfg_icon
-                text: "󰅶"
-            - lvgl.label.update:
-                id: lbl_cfg_name
-                text: "BEANS"
-            - lvgl.label.update:
-                id: lbl_cfg_value
-                text_font: montserrat_20
-                text: !lambda 'return id(beans_hop_ascii);'
-            - lvgl.label.update:
-                id: lbl_cfg_hint
-                text: !lambda |-
-                  if (id(cfg_edit)) {
-                    return std::string("turn to pick, tap to keep");
-                  }
-                  return std::string("tap to change - HOLD to save");
-      # Machine pre-infusion. Disabled / prebrew (pump pulses on-off-on) /
-      # preinfusion (line pressure only, then the pump). The Micra exposes
-      # them as one select, so this cycles rather than toggles.
-      - if:
-          condition:
-            lambda: 'return id(cfg_i) == 6;'
-          then:
-            - lvgl.label.update:
-                id: lbl_cfg_icon
-                text: "󰖏"
-            - lvgl.label.update:
-                id: lbl_cfg_name
-                text: "PRE-INFUSION"
-            - lvgl.label.update:
-                id: lbl_cfg_value
-                text_font: montserrat_20
-                text: !lambda |-
-                  switch (id(preinf_mode_val)) {
-                    case 0:  return "OFF";
-                    case 1:  return "PREBREW";
-                    default: return "PREINFUSION";
-                  }
-            - lvgl.label.update:
-                id: lbl_cfg_hint
-                text: "tap to cycle"
-      # Only meaningful in preinfusion mode -- prebrew uses its own on/off
-      # pair, which HA exposes as two other numbers, and marks this one
-      # unavailable. Show n/a rather than a stale figure.
+            - if:
+                condition:
+                  lambda: 'return id(clean_armed);'
+                then:
+                  - lambda: 'id(clean_armed) = false;'
+                  - logger.log: "CFG: starting backflush"
+                  - script.execute: start_clean
+                else:
+                  - lambda: 'id(clean_armed) = true;'
+      # PRE-INFUSION walks its own fields: mode, then whatever times that
+      # mode actually has. Past the last one it commits and closes.
       - if:
           condition:
             lambda: 'return id(cfg_i) == 7;'
           then:
-            - lvgl.label.update:
-                id: lbl_cfg_icon
-                text: "󰔛"
-            - lvgl.label.update:
-                id: lbl_cfg_name
-                text: "PRE-INF TIME"
-            - lvgl.label.update:
-                id: lbl_cfg_value
-                text_font: montserrat_48
-                text: !lambda |-
-                  static char b[12];
-                  if (id(preinf_mode_val) != 2) {
-                    snprintf(b, sizeof(b), "n/a");
+            - lambda: |-
+                if (!id(cfg_edit)) {
+                  id(cfg_edit) = true;
+                  id(cfg_sub) = 0;
+                } else {
+                  int last = (id(preinf_mode_val) == 0) ? 0
+                           : (id(preinf_mode_val) == 2) ? 1 : 2;
+                  if (id(cfg_sub) >= last) {
+                    id(cfg_edit) = false;
+                    id(cfg_sub) = 0;
                   } else {
-                    snprintf(b, sizeof(b), "%.1fs", id(preinf_time_val));
+                    id(cfg_sub)++;
                   }
-                  return b;
-            - lvgl.label.update:
-                id: lbl_cfg_hint
-                text: !lambda |-
-                  if (id(preinf_mode_val) != 2) {
-                    return std::string("set mode to PREINFUSION");
-                  }
-                  return id(cfg_edit) ? std::string("turn to set, tap to save")
-                                      : std::string("tap to adjust");
-      # The other half of pre-infusion. In prebrew the machine pulses the
-      # pump on-off-on instead of leaning on line pressure, and these two
-      # numbers are that pulse. They go unavailable in any other mode, which
-      # is why the card says which mode to pick rather than showing a stale
-      # figure -- the same treatment PRE-INF TIME gets.
+                }
+            - script.execute: push_preinf_all
+      # Everything else is a plain value: tap in, turn, tap out.
       - if:
           condition:
-            lambda: 'return id(cfg_i) == 8;'
+            lambda: |-
+              return id(cfg_i) == 1 || id(cfg_i) == 2 || id(cfg_i) == 3
+                  || id(cfg_i) == 4 || id(cfg_i) == 6;
           then:
-            - lvgl.label.update:
-                id: lbl_cfg_icon
-                text: "󰖏"
-            - lvgl.label.update:
-                id: lbl_cfg_name
-                text: "PREBREW ON"
-            - lvgl.label.update:
-                id: lbl_cfg_value
-                text_font: montserrat_48
-                text: !lambda |-
-                  static char b[12];
-                  if (id(preinf_mode_val) != 1) {
-                    snprintf(b, sizeof(b), "n/a");
-                  } else {
-                    snprintf(b, sizeof(b), "%.1fs", id(prebrew_on_val));
-                  }
-                  return b;
-            - lvgl.label.update:
-                id: lbl_cfg_hint
-                text: !lambda |-
-                  if (id(preinf_mode_val) != 1) {
-                    return std::string("set mode to PREBREW");
-                  }
-                  return id(cfg_edit) ? std::string("turn to set, tap to save")
-                                      : std::string("tap to adjust");
+            - lambda: 'id(cfg_edit) = !id(cfg_edit);'
+      - script.execute: paint_cfg
+  - id: paint_cfg
+    mode: restart
+    then:
+      # Nothing here is worth doing for a page that is not on screen, and
+      # this script is called from a dozen Home Assistant value handlers.
       - if:
           condition:
-            lambda: 'return id(cfg_i) == 9;'
+            lvgl.page.is_showing: page_cfg
           then:
-            - lvgl.label.update:
-                id: lbl_cfg_icon
-                text: "󰖏"
-            - lvgl.label.update:
-                id: lbl_cfg_name
-                text: "PREBREW OFF"
-            - lvgl.label.update:
-                id: lbl_cfg_value
-                text_font: montserrat_48
-                text: !lambda |-
-                  static char b[12];
-                  if (id(preinf_mode_val) != 1) {
-                    snprintf(b, sizeof(b), "n/a");
-                  } else {
-                    snprintf(b, sizeof(b), "%.1fs", id(prebrew_off_val));
+            - lambda: |-
+                char b[40];
+                uint32_t c = 0xFFFFFF;
+                std::string n, v, h;
+                switch (id(cfg_i)) {
+                  case 0:
+                    n = "EXIT"; v = ""; h = "tap to leave";
+                    break;
+                  case 1: {
+                    n = "STEAM";
+                    if (id(steam_sel) == 0) { v = "off"; c = 0x6A6A6A; }
+                    else {
+                      snprintf(b, sizeof(b), "%d", id(steam_sel));
+                      v = b; c = 0xE31E24;
+                    }
+                    h = id(cfg_edit) ? "turn: off, 1, 2, 3" : "tap to adjust";
+                    break;
                   }
-                  return b;
-            - lvgl.label.update:
-                id: lbl_cfg_hint
-                text: !lambda |-
-                  if (id(preinf_mode_val) != 1) {
-                    return std::string("set mode to PREBREW");
+                  case 2:
+                    n = "TEMP";
+                    snprintf(b, sizeof(b), "%.1f", id(coffee_temp_val));
+                    v = b;
+                    h = id(cfg_edit) ? "turn to set" : "tap to adjust";
+                    break;
+                  case 3:
+                    n = "RATIO";
+                    snprintf(b, sizeof(b), "1:%.2f", id(ratio_val));
+                    v = b;
+                    h = id(cfg_edit) ? "turn to set" : "tap to adjust";
+                    break;
+                  case 4:
+                    n = "TIME";
+                    if (id(tgt_time_val) < 0.5f) {
+                      v = "auto"; c = 0xC8913C;
+                      h = "following the grinder";
+                    } else {
+                      snprintf(b, sizeof(b), "%.0fs", id(tgt_time_val));
+                      v = b;
+                      h = id(cfg_edit) ? "turn to 0 for auto"
+                                       : "tap to adjust";
+                    }
+                    break;
+                  case 5:
+                    n = "BACKFLUSH";
+                    if (id(clean_armed)) {
+                      v = "READY"; c = 0xE31E24;
+                      h = "tap again to start";
+                    } else {
+                      v = "clean"; c = 0x8A8A8A;
+                      h = "tap to arm";
+                    }
+                    break;
+                  case 6:
+                    n = "BEANS";
+                    v = id(beans_hop_ascii); c = 0xC8913C;
+                    h = id(cfg_edit) ? "turn to pick, tap to keep"
+                                     : "tap to change";
+                    break;
+                  default: {
+                    n = "PRE-INFUSION";
+                    int m = id(preinf_mode_val);
+                    if (m == 0) { v = "off"; c = 0x6A6A6A; }
+                    else if (m == 2) {
+                      snprintf(b, sizeof(b), "%.1fs", id(preinf_time_val));
+                      v = b; c = 0x1F8B4C;
+                    } else {
+                      snprintf(b, sizeof(b), "%.1f + %.1f",
+                               id(prebrew_on_val), id(prebrew_off_val));
+                      v = b; c = 0x1F8B4C;
+                    }
+                    if (!id(cfg_edit)) h = "tap to set up";
+                    else if (id(cfg_sub) == 0) h = "turn: off / preinf / prebrew";
+                    else if (m == 2) h = "turn to set the time";
+                    else if (id(cfg_sub) == 1) h = "turn to set PUMP ON";
+                    else h = "turn to set PUMP OFF";
+                    break;
                   }
-                  return id(cfg_edit) ? std::string("turn to set, tap to save")
-                                      : std::string("tap to adjust");
-      - if:
-          condition:
-            lambda: 'return id(cfg_i) == 10;'
-          then:
-            - lvgl.label.update:
-                id: lbl_cfg_icon
-                text: "󰫠"
+                }
+                id(cfg_name) = n;
+                id(cfg_val) = v;
+                id(cfg_hint) = h;
+                id(cfg_val_c) = c;
             - lvgl.label.update:
                 id: lbl_cfg_name
-                text: "BACKFLUSH"
+                text: !lambda 'return id(cfg_name);'
             - lvgl.label.update:
                 id: lbl_cfg_value
-                text_font: montserrat_48
-                text: "CLEAN"
+                text: !lambda 'return id(cfg_val);'
+                text_color: !lambda 'return lv_color_hex(id(cfg_val_c));'
             - lvgl.label.update:
                 id: lbl_cfg_hint
-                text: "HOLD to start"
-      - if:
-          condition:
-            lambda: 'return id(cfg_i) == 11;'
-          then:
+                text: !lambda 'return id(cfg_hint);'
+            # The bright sector IS the cursor: one lit arc on a dim ring
+            # says where you are on a round screen the way a list never can.
+            - lvgl.widget.update:
+                id: ring_cfg
+                border_color: !lambda |-
+                  return lv_color_hex(id(cfg_edit) ? 0xFFFFFF : 0x1E1E1E);
+                border_width: !lambda 'return id(cfg_edit) ? 3 : 2;'
+            - lvgl.widget.update:
+                id: seg0
+                hidden: !lambda 'return id(cfg_i) != 0;'
             - lvgl.label.update:
-                id: lbl_cfg_icon
-                text: "󰁍"
+                id: rim0
+                text_color: !lambda |-
+                  return lv_color_hex(id(cfg_i) == 0 ? 0xFFFFFF : 0x4A4A4A);
+            - lvgl.widget.update:
+                id: seg1
+                hidden: !lambda 'return id(cfg_i) != 1;'
             - lvgl.label.update:
-                id: lbl_cfg_name
-                text: "BACK"
+                id: rim1
+                text_color: !lambda |-
+                  return lv_color_hex(id(cfg_i) == 1 ? 0xFFFFFF : 0x4A4A4A);
+            - lvgl.widget.update:
+                id: seg2
+                hidden: !lambda 'return id(cfg_i) != 2;'
             - lvgl.label.update:
-                id: lbl_cfg_value
-                text_font: montserrat_48
-                text: ""
+                id: rim2
+                text_color: !lambda |-
+                  return lv_color_hex(id(cfg_i) == 2 ? 0xFFFFFF : 0x4A4A4A);
+            - lvgl.widget.update:
+                id: seg3
+                hidden: !lambda 'return id(cfg_i) != 3;'
             - lvgl.label.update:
-                id: lbl_cfg_hint
-                text: "tap to exit"
-
-  # Good = the ratio AND the time both inside your own bands. See calc_verdict.
+                id: rim3
+                text_color: !lambda |-
+                  return lv_color_hex(id(cfg_i) == 3 ? 0xFFFFFF : 0x4A4A4A);
+            - lvgl.widget.update:
+                id: seg4
+                hidden: !lambda 'return id(cfg_i) != 4;'
+            - lvgl.label.update:
+                id: rim4
+                text_color: !lambda |-
+                  return lv_color_hex(id(cfg_i) == 4 ? 0xFFFFFF : 0x4A4A4A);
+            - lvgl.widget.update:
+                id: seg5
+                hidden: !lambda 'return id(cfg_i) != 5;'
+            - lvgl.label.update:
+                id: rim5
+                text_color: !lambda |-
+                  return lv_color_hex(id(cfg_i) == 5 ? 0xFFFFFF : 0x4A4A4A);
+            - lvgl.widget.update:
+                id: seg6
+                hidden: !lambda 'return id(cfg_i) != 6;'
+            - lvgl.label.update:
+                id: rim6
+                text_color: !lambda |-
+                  return lv_color_hex(id(cfg_i) == 6 ? 0xFFFFFF : 0x4A4A4A);
+            - lvgl.widget.update:
+                id: seg7
+                hidden: !lambda 'return id(cfg_i) != 7;'
+            - lvgl.label.update:
+                id: rim7
+                text_color: !lambda |-
+                  return lv_color_hex(id(cfg_i) == 7 ? 0xFFFFFF : 0x4A4A4A);
   - id: shot_result
     mode: restart
     then:
@@ -3248,34 +3146,19 @@ lvgl:
               lambda: 'return millis() - id(wake_ms) > $wake_guard_ms;'
             then:
               - script.execute: cfg_act
+      # HOLD means leave. Everywhere, no exceptions, including out of an
+      # edit -- which makes it the undo this page never had. Backflush used
+      # to be a hold on an item one detent from BACK, while hold meant
+      # "exit" on all eleven others; that is now two taps on its own sector.
       on_long_press:
-        - if:
-            condition:
-              lambda: |-
-                return id(cfg_i) == 10
-                    && millis() - id(wake_ms) > $wake_guard_ms;
-            then:
-              - logger.log: "CFG: starting backflush"
-              # Everything about arming lives in start_clean, including the
-              # wake-from-standby step -- the page should not know the order.
-              - script.execute: start_clean
-            else:
-              - if:
-                  condition:
-                    lambda: |-
-                      return id(cfg_i) == 5
-                          && millis() - id(wake_ms) > $wake_guard_ms;
-                  then:
-                    # Holding on the beans item writes the machine settings
-                    # that are on screen right now into the slot for the
-                    # grinder's current recipe. Nothing to navigate to.
-                    - script.execute: preset_save
-                  else:
-                    - script.execute:
-                        id: haptic
-                        effect: 1
-                    - lambda: 'id(cfg_edit) = false;'
-                    - script.execute: go_main
+        - script.execute:
+            id: haptic
+            effect: 1
+        - lambda: |-
+            id(cfg_edit) = false;
+            id(cfg_sub) = 0;
+            id(clean_armed) = false;
+        - script.execute: go_main
       widgets:
         - obj:
             id: ring_cfg
@@ -3284,21 +3167,222 @@ lvgl:
             height: 348
             radius: 174
             bg_opa: TRANSP
-            border_width: 6
-            border_color: 0xE31E24
+            border_width: 2
+            border_color: 0x1E1E1E
             pad_all: 0
             clickable: false
             scrollable: false
-        - label:
-            id: lbl_cfg_icon
-            text: "󱌙"
-            text_font: mdi_40
-            text_color: 0xE31E24
+        - arc:
+            id: seg0
             align: CENTER
-            y: -96
+            width: 330
+            height: 330
+            start_angle: 252
+            end_angle: 288
+            min_value: 0
+            max_value: 100
+            value: 100
+            adjustable: false
+            arc_width: 16
+            arc_opa: TRANSP
+            hidden: true
+            clickable: false
+            indicator:
+              arc_width: 16
+              arc_color: 0xE31E24
+        - arc:
+            id: seg1
+            align: CENTER
+            width: 330
+            height: 330
+            start_angle: 297
+            end_angle: 333
+            min_value: 0
+            max_value: 100
+            value: 100
+            adjustable: false
+            arc_width: 16
+            arc_opa: TRANSP
+            hidden: true
+            clickable: false
+            indicator:
+              arc_width: 16
+              arc_color: 0xE31E24
+        - arc:
+            id: seg2
+            align: CENTER
+            width: 330
+            height: 330
+            start_angle: 342
+            end_angle: 18
+            min_value: 0
+            max_value: 100
+            value: 100
+            adjustable: false
+            arc_width: 16
+            arc_opa: TRANSP
+            hidden: true
+            clickable: false
+            indicator:
+              arc_width: 16
+              arc_color: 0xE31E24
+        - arc:
+            id: seg3
+            align: CENTER
+            width: 330
+            height: 330
+            start_angle: 27
+            end_angle: 63
+            min_value: 0
+            max_value: 100
+            value: 100
+            adjustable: false
+            arc_width: 16
+            arc_opa: TRANSP
+            hidden: true
+            clickable: false
+            indicator:
+              arc_width: 16
+              arc_color: 0xE31E24
+        - arc:
+            id: seg4
+            align: CENTER
+            width: 330
+            height: 330
+            start_angle: 72
+            end_angle: 108
+            min_value: 0
+            max_value: 100
+            value: 100
+            adjustable: false
+            arc_width: 16
+            arc_opa: TRANSP
+            hidden: true
+            clickable: false
+            indicator:
+              arc_width: 16
+              arc_color: 0xE31E24
+        - arc:
+            id: seg5
+            align: CENTER
+            width: 330
+            height: 330
+            start_angle: 117
+            end_angle: 153
+            min_value: 0
+            max_value: 100
+            value: 100
+            adjustable: false
+            arc_width: 16
+            arc_opa: TRANSP
+            hidden: true
+            clickable: false
+            indicator:
+              arc_width: 16
+              arc_color: 0xE31E24
+        - arc:
+            id: seg6
+            align: CENTER
+            width: 330
+            height: 330
+            start_angle: 162
+            end_angle: 198
+            min_value: 0
+            max_value: 100
+            value: 100
+            adjustable: false
+            arc_width: 16
+            arc_opa: TRANSP
+            hidden: true
+            clickable: false
+            indicator:
+              arc_width: 16
+              arc_color: 0xE31E24
+        - arc:
+            id: seg7
+            align: CENTER
+            width: 330
+            height: 330
+            start_angle: 207
+            end_angle: 243
+            min_value: 0
+            max_value: 100
+            value: 100
+            adjustable: false
+            arc_width: 16
+            arc_opa: TRANSP
+            hidden: true
+            clickable: false
+            indicator:
+              arc_width: 16
+              arc_color: 0xE31E24
+        - label:
+            id: rim0
+            text: "EXIT"
+            text_font: montserrat_16
+            text_color: 0x4A4A4A
+            align: CENTER
+            x: 0
+            y: -132
+        - label:
+            id: rim1
+            text: "STEAM"
+            text_font: montserrat_16
+            text_color: 0x4A4A4A
+            align: CENTER
+            x: 93
+            y: -93
+        - label:
+            id: rim2
+            text: "TEMP"
+            text_font: montserrat_16
+            text_color: 0x4A4A4A
+            align: CENTER
+            x: 132
+            y: 0
+        - label:
+            id: rim3
+            text: "RATIO"
+            text_font: montserrat_16
+            text_color: 0x4A4A4A
+            align: CENTER
+            x: 93
+            y: 93
+        - label:
+            id: rim4
+            text: "TIME"
+            text_font: montserrat_16
+            text_color: 0x4A4A4A
+            align: CENTER
+            x: 0
+            y: 132
+        - label:
+            id: rim5
+            text: "CLEAN"
+            text_font: montserrat_16
+            text_color: 0x4A4A4A
+            align: CENTER
+            x: -93
+            y: 93
+        - label:
+            id: rim6
+            text: "BEANS"
+            text_font: montserrat_16
+            text_color: 0x4A4A4A
+            align: CENTER
+            x: -132
+            y: 0
+        - label:
+            id: rim7
+            text: "PRE-INF"
+            text_font: montserrat_16
+            text_color: 0x4A4A4A
+            align: CENTER
+            x: -93
+            y: -93
         - label:
             id: lbl_cfg_name
-            text: "STEAM BOILER"
+            text: "STEAM"
             text_font: montserrat_16
             text_color: 0x8A8A8A
             align: CENTER
