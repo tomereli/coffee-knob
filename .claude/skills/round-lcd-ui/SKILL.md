@@ -147,6 +147,15 @@ one where the mock renderer's own bug was shipped as a finding to the user.
 - **An edit indicator should be quieter than the content.** A hard white ring
   around a black screen is the brightest thing on the panel, and it is only
   saying "you are editing".
+- **An indicator has to be checked against the thing it claims to indicate.**
+  A verdict colour is a claim that some measurement predicts an outcome. On
+  this device the ring turned red or green on a ratio, and when the rated
+  history was finally grouped by the user's own scores, the ratio did not
+  separate the good cups from the bad ones -- the shots nearest the target
+  were, if anything, slightly worse. Layout review cannot catch this: the
+  widget renders perfectly and says something false. Before shipping a
+  verdict, look at whether its input distributions actually differ across the
+  outcomes; if they overlap, show the number and drop the colour.
 
 ## Keeping this current
 

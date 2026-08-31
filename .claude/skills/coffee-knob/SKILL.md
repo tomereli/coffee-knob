@@ -121,13 +121,54 @@ never arrives cannot clear a flag.
 ## The rating flow, and what it is for
 
 The user rates shots: serve (espresso/milk), taste (-2 sour .. +2 bitter),
-score 1-5, written to HA and appended to a shot log.
+score 1-5, written to HA and logged as a row in `todo.coffee_shot_log`.
 
-**Today nothing reads any of it back.** The ring is coloured against a target
-ratio typed by hand. The obvious payoff is to judge a shot against the band
-the user's own 4- and 5-star shots occupy, segmented by bean and by serve --
-turning "did you hit the number you guessed" into "was this like the cups you
-liked". Not built yet; it is the highest-value idea on the list.
+The payoff is judging a shot against the band the user's own 4- and 5-star
+shots occupy rather than against a number typed by hand -- "was this like the
+cups you liked" instead of "did you hit your guess". Before building any of
+that, read the section below: the first time the log was actually analysed, it
+overturned the premise.
+
+## Read the log before trusting the screen
+
+Twenty-two rated shots, analysed:
+
+**Ratio does not predict whether he liked the cup.** Five of six 1-2 star
+shots sit inside the ratio range of the 4-5 star shots, and the bad shots'
+median ratio was *closer* to the configured target than the good ones'. The
+target was 1:1.95 +/- 0.10, which put 2 of 16 good shots inside the green
+window -- the ring was calling fourteen cups he liked bad, and was slightly
+anti-correlated with his own verdict. Retuned to 1:1.70 +/- 0.15 (10 of 16
+good, 2 of 6 bad) from the median of his own 4+ shots.
+
+**Shot time does predict it.** Good 24.0-29.1s, bad 26.0-35.5s. Long is bad.
+That is the axis a learned band is worth building on.
+
+**Before colouring anything by a metric, check that the metric separates the
+outcomes.** Group the rated history by the verdict and look at whether the
+distributions overlap. A verdict colour driven by a metric that does not
+discriminate is not neutral -- it trains the user to ignore the indicator.
+
+## Numbers this device writes into the record need a range check
+
+`script.coffee_log_shot` preferred the knob's shot time over Mahlkonig's.
+While the stopwatch was counting interval ticks it wrote times like 1.8s and
+2.0s, and nothing in the chain knew what an espresso looks like, so **half the
+history carries an impossible extraction time**. The firmware bug is fixed;
+those rows are wrong forever, and every future analysis has to filter them.
+
+The guard is now in the script: a shot time under 5 seconds is brew detection
+failing, not an extraction, and the Mahlkonig value is used instead.
+
+**The record outlives the bug.** Any value this device pushes into a log gets
+a plausibility check at the point of writing -- not because the sender is
+expected to be wrong, but because when it is, the damage is permanent and
+silent.
+
+**An append is a claim that this is a new subject.** Re-rating a shot called
+`todo.add_item` again and produced a second row for the same pull, double-
+weighting it in every average. The script now fingerprints the pull by dose,
+yield and date, and amends the existing row instead.
 
 ## The preview pipeline
 
