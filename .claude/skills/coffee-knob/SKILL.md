@@ -98,6 +98,26 @@ OTA password means the next flash must be over USB.
   counter reads low -- and that number was being logged to HA as the shot
   time, biasing the whole history short.
 
+## Home Assistant tightens over time, and the knob fails silently when it does
+
+Two defects appeared without a line of firmware changing, both because a
+dependency got stricter:
+
+**Service parameters are validated now.** `input_select.select_next` was
+called with `cycle: "true"` -- ESPHome sends every `data:` value as a string,
+and Home Assistant rejects the string form with a 400 that goes nowhere the
+user can see. The beans simply could not be changed from the knob. Prefer
+omitting an optional parameter over sending it as a string; check a suspect
+call by making it directly and reading the response, not by reading the log.
+
+**The La Marzocco integration drops to `unavailable` several times a day**,
+including mid-shot. An ESPHome `homeassistant` binary_sensor fires
+`on_press`/`on_release` on state *changes*; going unavailable is an absence,
+not a release, so `shot_running` stayed true and the stopwatch ran on. Any
+state this device latches on a `homeassistant` binary_sensor needs an
+explicit `has_state()` check somewhere that runs periodically -- an edge that
+never arrives cannot clear a flag.
+
 ## The rating flow, and what it is for
 
 The user rates shots: serve (espresso/milk), taste (-2 sour .. +2 bitter),

@@ -2135,10 +2135,13 @@ script:
             lambda: 'return id(cfg_edit) && id(cfg_i) == 5 && delta > 0;'
           then:
             - homeassistant.action:
+                # No cycle: here. Home Assistant validates it as a boolean
+                # and rejects the string ESPHome sends with 400, silently --
+                # which is why the beans could not be changed from the knob.
+                # Wrapping is the default anyway.
                 action: input_select.select_next
                 data:
                   entity_id: input_select.coffee_current_beans
-                  cycle: "true"
       - if:
           condition:
             lambda: 'return id(cfg_edit) && id(cfg_i) == 5 && delta < 0;'
@@ -2147,7 +2150,6 @@ script:
                 action: input_select.select_previous
                 data:
                   entity_id: input_select.coffee_current_beans
-                  cycle: "true"
       - if:
           condition:
             lambda: 'return id(cfg_edit) && id(cfg_i) == 7;'
@@ -3020,7 +3022,24 @@ interval:
                 // Nothing real runs past two minutes. The paddle release
                 // going missing (HA restarting mid-shot) used to leave this
                 // counting until morning and then log it.
-                if (id(shot_ds) > 1200) {
+                // MEASURED 31 Aug: the La Marzocco integration drops to
+                // unavailable several times a day, twice in the middle of a
+                // shot. ESPHome never sees on_release then -- only an
+                // absence -- so the timer ran on. Treat losing the sensor as
+                // the end of the shot and go and wait for the grind record,
+                // which is the same thing a paddle release does.
+                if (!id(micra_brewing).has_state()) {
+                  id(shot_running) = false;
+                  if (id(shot_ds) >= 100) {
+                    id(waiting_shot) = true;
+                    id(wait_ds) = 0;
+                  }
+                  ESP_LOGW("shot", "brewing sensor lost at %.1fs, ending shot",
+                           id(shot_ds) / 10.0f);
+                }
+                // Backstop for anything the check above does not catch. 75 s
+                // is well past the longest real shot measured here (38 s).
+                else if (id(shot_ds) > 750) {
                   id(shot_running) = false;
                   id(waiting_shot) = false;
                   ESP_LOGW("shot", "watchdog: no paddle release, stopped");
