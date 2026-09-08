@@ -130,8 +130,15 @@ api:
   encryption:
     key: !secret coffee_knob_api_key
   on_client_connected:
+    - script.execute: paint_link
     - delay: 2s
     - script.execute: paint_main
+  on_client_disconnected:
+    # The dangerous link. Every value on the glass comes from HA, so losing
+    # this freezes the whole display at its last reading with nothing to say
+    # so. The indicator must be driven locally, because it has to work
+    # precisely when HA cannot be asked anything.
+    - script.execute: paint_link
 
 ota:
   - platform: esphome
@@ -1726,6 +1733,61 @@ script:
           id(res_c) = (r_ok && t_ok) ? 0x35C759
                     : ((r_ok || t_ok) ? 0xE8A33D : 0xE31E24);
 
+  # Two links fail independently and the repair differs, so one dot cannot
+  # carry both. Silence means both are up: an indicator that is lit in normal
+  # operation is an indicator nobody reads.
+  #
+  # The machine probe is micra_on, which mirrors switch.la_minea_micra and is
+  # on/off in normal operation. NOT "any La Marzocco entity is unavailable" --
+  # 9 of the 25 were unavailable while the machine was brewing fine, because
+  # the boiler-ready and brewing-start timestamps are absent by design
+  # whenever the boiler is not heating. That mistake is what pushed a false
+  # alert to his phone.
+  #
+  # has_state() rather than an edge: going unavailable is an absence, and no
+  # on_state fires for it, so this is also called from the interval below.
+  - id: paint_link
+    mode: restart
+    then:
+      - if:
+          condition:
+            not:
+              api.connected:
+          then:
+            # Everything on the glass is frozen, so the veil covers all of it
+            # and the machine word is redundant -- with HA gone the machine
+            # probe is absent too and would light for the wrong reason.
+            - lvgl.widget.show: veil
+            - lvgl.label.update:
+                id: lbl_offline
+                text: "OFFLINE"
+            - lvgl.label.update: {id: lbl_nomach_main, text: ""}
+            - lvgl.label.update: {id: lbl_nomach_cfg,  text: ""}
+            - lvgl.label.update: {id: lbl_nomach_care, text: ""}
+            - lvgl.label.update: {id: lbl_nomach_boil, text: ""}
+          else:
+            - lvgl.widget.hide: veil
+            - lvgl.label.update:
+                id: lbl_offline
+                text: ""
+            - if:
+                condition:
+                  lambda: 'return !id(micra_on).has_state();'
+                then:
+                  # HA is answering, so the grinder and shot pages are live;
+                  # only the machine's own readings are not. paint_main
+                  # already drops its big value to "..." here, which is why
+                  # this does not veil the screen.
+                  - lvgl.label.update: {id: lbl_nomach_main, text: "NO MACHINE"}
+                  - lvgl.label.update: {id: lbl_nomach_cfg,  text: "NO MACHINE"}
+                  - lvgl.label.update: {id: lbl_nomach_care, text: "NO MACHINE"}
+                  - lvgl.label.update: {id: lbl_nomach_boil, text: "NO MACHINE"}
+                else:
+                  - lvgl.label.update: {id: lbl_nomach_main, text: ""}
+                  - lvgl.label.update: {id: lbl_nomach_cfg,  text: ""}
+                  - lvgl.label.update: {id: lbl_nomach_care, text: ""}
+                  - lvgl.label.update: {id: lbl_nomach_boil, text: ""}
+
   - id: paint_main
     mode: restart
     then:
@@ -3008,6 +3070,13 @@ script:
             - script.execute: go_main
 
 interval:
+  # Losing a homeassistant sensor is an absence, not a state change, so
+  # nothing calls paint_link when the machine link dies. Cheap enough to just
+  # ask every two seconds.
+  - interval: 2s
+    then:
+      - script.execute: paint_link
+
   - interval: 100ms
     then:
       - if:
@@ -3113,6 +3182,45 @@ lvgl:
   # USB-C end is the top when plugged in for power. mipi_spi reports hardware
   # rotation, so LVGL does this in the panel, not on the CPU.
   rotation: 180
+  # Above every page, so the link state does not have to be repeated on eight
+  # of them and cannot be forgotten on the ninth.
+  top_layer:
+    widgets:
+      # Drawn first so the label below it stays legible. Only shown when the
+      # knob cannot reach HA, which is when every number on the glass is
+      # frozen at its last value: the veil is the screen saying so.
+      - obj:
+          id: veil
+          hidden: true
+          align: CENTER
+          width: 360
+          height: 360
+          radius: 180
+          bg_color: 0x000000
+          # Effectively opaque, and that is the design rather than a limit
+          # of it. 65 left the frozen values reading clearly and OFFLINE
+          # landed on a dimmed HEATING as two superimposed words; 90 still
+          # left a ghost. With HA gone every number behind this is
+          # meaningless, so an offline screen is its own screen -- a black
+          # field with one word -- not a dimmed copy of a live one. It also
+          # means the word cannot collide with page content on any page.
+          bg_opa: 98%
+          border_width: 0
+          pad_all: 0
+          clickable: false
+      # Centred, on the veil, where there is the most room and no page content
+      # to fight. Two earlier attempts put this at the bottom of the glass:
+      # y=152 rendered sitting on the rim ring, and y=144 rendered touching
+      # "tap to rate" on page_result. The bottom band is occupied on half the
+      # pages, and the veil is already covering everything here.
+      - label:
+          id: lbl_offline
+          text: ""
+          text_font: montserrat_20
+          text_color: 0xE06A6A
+          text_letter_space: 3
+          align: CENTER
+          clickable: false
   pages:
     # ---------------- MAIN ----------------
     - id: page_main
@@ -3225,6 +3333,16 @@ lvgl:
                   align: CENTER
 
     # ---------------- CONTROL ----------------
+        # Only on the machine pages. The lowest content across these four is
+        # btn_power at +125, so y=144 clears it and clears the rim ring.
+        - label:
+            id: lbl_nomach_main
+            text: ""
+            text_font: montserrat_16
+            text_color: 0xD8A657
+            text_letter_space: 2
+            align: CENTER
+            y: 144
     - id: page_cfg
       bg_color: 0x000000
       on_short_click:
@@ -3311,6 +3429,16 @@ lvgl:
     # Phase 1: the machine is armed and waiting for the paddle (15 s).
     # Phase 2: the paddle moved, the cycle is running (~90 s).
     # Both live here; paint_clean decides which by elapsed time.
+        # Only on the machine pages. The lowest content across these four is
+        # btn_power at +125, so y=144 clears it and clears the rim ring.
+        - label:
+            id: lbl_nomach_cfg
+            text: ""
+            text_font: montserrat_16
+            text_color: 0xD8A657
+            text_letter_space: 2
+            align: CENTER
+            y: 144
     - id: page_clean
       bg_color: 0x000000
       # Same safety valve. Hold only -- a stray tap during a live backflush
@@ -3564,6 +3692,16 @@ lvgl:
     # Read-only on purpose: temperature and steam level are EDITED on the
     # control page, and having two places that both look editable is how you
     # end up changing the wrong one.
+        # Only on the machine pages. The lowest content across these four is
+        # btn_power at +125, so y=144 clears it and clears the rim ring.
+        - label:
+            id: lbl_nomach_care
+            text: ""
+            text_font: montserrat_16
+            text_color: 0xD8A657
+            text_letter_space: 2
+            align: CENTER
+            y: 144
     - id: page_boil
       bg_color: 0x000000
       # One-touch escape from any secondary card.
@@ -3618,6 +3756,16 @@ lvgl:
             y: 88
 
     # ---------------- SHOT ----------------
+        # Only on the machine pages. The lowest content across these four is
+        # btn_power at +125, so y=144 clears it and clears the rim ring.
+        - label:
+            id: lbl_nomach_boil
+            text: ""
+            text_font: montserrat_16
+            text_color: 0xD8A657
+            text_letter_space: 2
+            align: CENTER
+            y: 144
     - id: page_shot
       bg_color: 0x000000
       # This page used to be a dead end: no gesture left it, so a slow

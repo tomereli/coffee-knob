@@ -111,12 +111,15 @@ def widgets_of(page):
     return out
 
 
-def render(page, state):
+def render(page, state, layer=None):
     img = Image.new('RGB', (SIZE, SIZE), (0, 0, 0))
     d = ImageDraw.Draw(img)
     cx = cy = SIZE / 2
 
-    for kind, spec in widgets_of(page):
+    # top_layer draws over every page on the device, so leaving it out of the
+    # render makes the picture disagree with the glass on nine screens at
+    # once. Appended after the page so the z-order matches LVGL's.
+    for kind, spec in widgets_of(page) + (widgets_of(layer) if layer else []):
         wid = spec.get('id', '')
         if spec.get('hidden') and wid not in state:
             continue
@@ -126,6 +129,18 @@ def render(page, state):
         if kind == 'obj':
             w = spec.get('width', 0)
             h = spec.get('height', 0)
+            bg = state.get(wid + '#bg', spec.get('bg_color'))
+            if bg is not None:
+                opa = str(spec.get('bg_opa', '100%')).strip()
+                pct = float(opa[:-1]) if opa.endswith('%') else float(opa) / 2.55
+                over = Image.new('RGBA', img.size, (0, 0, 0, 0))
+                ImageDraw.Draw(over).ellipse(
+                    [cx + x - w / 2, cy + y - h / 2,
+                     cx + x + w / 2, cy + y + h / 2],
+                    fill=rgb(bg, (0, 0, 0)) + (int(round(pct * 2.55)),))
+                img = Image.alpha_composite(img.convert('RGBA'),
+                                            over).convert('RGB')
+                d = ImageDraw.Draw(img)
             bw = state.get(wid + '#bw', spec.get('border_width', 0))
             col = rgb(state.get(wid + '#border', spec.get('border_color')),
                       (60, 60, 60))
@@ -172,6 +187,7 @@ def main(cfg_path, page_id, states_path, out_path):
     cfg = yaml.load(open(cfg_path, encoding='utf-8').read(), Loader=Loader)
     page = next((p for p in (cfg.get('lvgl') or {}).get('pages') or []
                  if p.get('id') == page_id), None)
+    layer = (cfg.get('lvgl') or {}).get('top_layer')
     if page is None:
         raise SystemExit('no such page: %s' % page_id)
 
@@ -192,7 +208,7 @@ def main(cfg_path, page_id, states_path, out_path):
         oy = pad + r * (SIZE + pad + cap)
         dd.text((ox + SIZE / 2, oy + 11), title, font=small,
                 fill=(170, 170, 170), anchor='mm')
-        sheet.paste(render(page, st), (ox, oy + cap))
+        sheet.paste(render(page, st, layer), (ox, oy + cap))
 
     sheet.save(out_path)
     print('wrote %s  (%dx%d, font %s)'

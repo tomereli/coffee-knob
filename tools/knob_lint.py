@@ -79,8 +79,17 @@ def walk(widgets, page, out):
 
 def collect(cfg):
     found = []
-    for pg in (cfg.get('lvgl') or {}).get('pages') or []:
+    lv = cfg.get('lvgl') or {}
+    for pg in lv.get('pages') or []:
         walk(pg.get('widgets'), pg.get('id', '?'), found)
+    # top_layer draws over every page, so a label placed there is on the glass
+    # nine times and was checked zero. This walked only pages: until a link
+    # indicator was added to top_layer, passed the lint, and had never been
+    # looked at -- the lint said nothing because it could not see it.
+    for name in ('top_layer', 'bottom_layer'):
+        layer = lv.get(name)
+        if isinstance(layer, dict):
+            walk(layer.get('widgets'), name, found)
     return found
 
 
@@ -146,15 +155,22 @@ def main(path):
     # lbl_main_care sat at y=54 spanning +46..+62 with two 78px buttons at
     # y=86 spanning +47..+125, and "backflush due" was never once drawn where
     # a person could see it.
+    # Order matters and is the rule LVGL actually follows: siblings draw in
+    # declaration order, so a label declared AFTER a solid is on top of it and
+    # a label declared before it is buried. Without this the check fired on a
+    # link indicator deliberately declared after its dimming veil -- correct
+    # on the glass, and reported as invisible. Opacity is deliberately not
+    # consulted: a 95%-opaque overlay hides a label just as well as a solid
+    # one, so the only safe exemption is being drawn later.
     solids = {}
-    for page, kind, spec in collect(cfg):
+    for idx, (page, kind, spec) in enumerate(collect(cfg)):
         if kind in ('button', 'obj') and spec.get('bg_color') is not None:
             solids.setdefault(page, []).append(
                 (spec.get('id', '(anon)'), spec.get('x', 0) or 0,
                  spec.get('y', 0) or 0, spec.get('width', 0),
-                 spec.get('height', 0)))
+                 spec.get('height', 0), idx))
 
-    for page, kind, spec in collect(cfg):
+    for label_idx, (page, kind, spec) in enumerate(collect(cfg)):
         if kind != 'label':
             continue
         wid = spec.get('id')
@@ -197,7 +213,9 @@ def main(path):
             font = declared_font
             w, h = text_width(txt, font), text_height(font)
 
-        for sid, sx, sy, sw, sh in solids.get(page, []):
+        for sid, sx, sy, sw, sh, solid_idx in solids.get(page, []):
+            if label_idx > solid_idx:
+                continue
             if (abs(y - sy) < (h + sh) / 2 and abs(x - sx) < (w + sw) / 2):
                 errors.append(
                     '%s/%s at (%+d,%+d) is behind %s, which is opaque and '
