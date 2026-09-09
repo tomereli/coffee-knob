@@ -503,6 +503,19 @@ sensor:
           if (!id(cfg_edit) && !std::isnan(x)) id(preinf_time_val) = x;
       - script.execute: paint_cfg
 
+  # --- WiFi ---
+  # The outage this chip exists for was wifi, not Home Assistant: the knob sat
+  # off the network while HA was fine, and nothing on the glass said so. A
+  # number is carried rather than a bar count because a thinning margin is the
+  # part that predicts the next one.
+  - platform: wifi_signal
+    id: rssi
+    name: "WiFi Signal"
+    entity_category: diagnostic
+    update_interval: 30s
+    on_value:
+      - script.execute: paint_link
+
   # --- Battery ---
   # The board does have an MX1.25 li-po socket and a charge-management IC,
   # and system voltage reaches the MCU on GPIO1 (ADC1_CH0) behind a 2:1
@@ -1749,6 +1762,72 @@ script:
   - id: paint_link
     mode: restart
     then:
+      # Wifi first. Wifi down implies HA down, so asking about HA first would
+      # report the symptom and bury the cause -- which is exactly how the last
+      # outage read from across the kitchen.
+      - if:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - lvgl.label.update:
+                id: lbl_net
+                text: "NO WIFI"
+                text_color: 0xE06A6A
+          else:
+            - if:
+                condition:
+                  not:
+                    api.connected:
+                then:
+                  - lvgl.label.update:
+                      id: lbl_net
+                      text: "NO HA"
+                      text_color: 0xD8A657
+                else:
+                  - lvgl.label.update:
+                      id: lbl_net
+                      text: !lambda |-
+                        static char b[8];
+                        float r = id(rssi).state;
+                        if (std::isnan(r)) return std::string("WIFI");
+                        snprintf(b, sizeof(b), "%d", (int) lroundf(r));
+                        return std::string(b);
+                      text_color: !lambda |-
+                        float r = id(rssi).state;
+                        return (!std::isnan(r) && r < -75.0f)
+                                 ? lv_color_hex(0xD8A657) : lv_color_hex(0x4A4A4A);
+      # Power. What this can and cannot say is a property of the board, not of
+      # the code: no charge-status line is broken out to any GPIO, so charging
+      # is not observable and a full pack on USB is indistinguishable from no
+      # pack at all. So the chip reports the question it can answer -- which
+      # rail the knob is running on -- and never guesses at the other one.
+      #
+      # On this device it will read USB and never change: the socket is empty,
+      # and seven days of the rail sitting between 4.68 and 4.83 V with no dip
+      # confirms it. It starts telling the truth the moment a cell is fitted,
+      # which is why the percentage branch is here rather than omitted.
+      - if:
+          condition:
+            lambda: 'return std::isnan(id(batt_v).state) || id(batt_v).state > 4.35f;'
+          then:
+            - lvgl.label.update:
+                id: lbl_pwr
+                text: "USB"
+                text_color: 0x4A4A4A
+          else:
+            - lvgl.label.update:
+                id: lbl_pwr
+                text: !lambda |-
+                  static char b[8];
+                  float p = id(batt_level).state;
+                  if (std::isnan(p)) return std::string("BATT");
+                  snprintf(b, sizeof(b), "%d%%", (int) lroundf(p));
+                  return std::string(b);
+                text_color: !lambda |-
+                  float p = id(batt_level).state;
+                  return (!std::isnan(p) && p < 20.0f)
+                           ? lv_color_hex(0xE06A6A) : lv_color_hex(0xD8A657);
       - if:
           condition:
             not:
@@ -3220,6 +3299,35 @@ lvgl:
           text_color: 0xE06A6A
           text_letter_space: 3
           align: CENTER
+          clickable: false
+      # Declared last, so they draw ON TOP of the veil. That is the whole
+      # point of them being here: when the knob cannot reach HA the veil
+      # covers the page, and these two are then the only things on the glass
+      # that can say which link went -- which is the diagnostic the device
+      # could not give before.
+      #
+      # y -132 is the one band free on all eight pages. Measured, not guessed:
+      # the highest content anywhere is page_main's READY line at -158..-142,
+      # and the next highest is page_shot's bean name at -120, so a 14px row
+      # at -139..-125 clears both. Two earlier placements were picked by eye
+      # and both landed on top of something.
+      - label:
+          id: lbl_net
+          text: ""
+          text_font: montserrat_14
+          text_color: 0x4A4A4A
+          align: CENTER
+          x: -56
+          y: -132
+          clickable: false
+      - label:
+          id: lbl_pwr
+          text: ""
+          text_font: montserrat_14
+          text_color: 0x4A4A4A
+          align: CENTER
+          x: 56
+          y: -132
           clickable: false
   pages:
     # ---------------- MAIN ----------------
