@@ -23,7 +23,7 @@ import sys
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from knob_geometry import (SAFE_RADIUS, DEFAULT_FONT, FONT_ADV,
+from knob_geometry import (register_fonts, SAFE_RADIUS, DEFAULT_FONT, FONT_ADV,
                            text_width, text_height, half_chord, fits)
 
 
@@ -45,6 +45,9 @@ WIDGET_KINDS = ('label', 'arc', 'obj', 'image', 'button', 'bar', 'line',
                 'meter', 'spinner', 'led')
 
 UNBOUNDED_CHARS = 24
+# One printf conversion, capturing an explicit minimum field width.
+CONV = re.compile(r'%[-+ #0]*(\d*)(?:\.\d+)?[a-zA-Z]')
+
 LITERAL = re.compile(r'"((?:[^"\\]|\\.)*)"')
 IDREF = re.compile(r'id\(\s*(\w+)\s*\)')
 
@@ -67,14 +70,34 @@ def string_sources(cfg):
     return out
 
 
-def walk(widgets, page, out):
+# Ancestor id chain per widget, keyed by the spec dict's identity rather
+# than its id -- the widgets this exists to exempt are a button's own caption
+# and those are usually anonymous, so keying by name would collapse them all
+# onto None.
+PARENTS = {}
+
+# Absolute position per widget. A nested widget's x/y are relative to its
+# PARENT, and treating them as screen coordinates put all six of the bedside
+# knob's button captions at x=0 -- so three were checked against the wrong
+# part of the glass and the middle one was reported as buried under the
+# button next door. Their real centres are about -70, 0 and +70.
+ORIGIN = {}
+
+
+def walk(widgets, page, out, chain=(), ox=0, oy=0):
     for w in widgets or []:
         if not isinstance(w, dict):
             continue
         for kind in WIDGET_KINDS:
             if kind in w and isinstance(w[kind], dict):
-                out.append((page, kind, w[kind]))
-                walk(w[kind].get('widgets'), page, out)
+                spec = w[kind]
+                out.append((page, kind, spec))
+                PARENTS[id(spec)] = chain
+                ORIGIN[id(spec)] = (ox, oy)
+                walk(spec.get('widgets'), page, out,
+                     chain + (spec.get('id', '(anon)'),),
+                     ox + (spec.get('x', 0) or 0),
+                     oy + (spec.get('y', 0) or 0))
 
 
 def collect(cfg):
@@ -113,6 +136,52 @@ def label_writes(node, out=None):
     return out
 
 
+def _covers_glass(spec):
+    """A solid big enough and opaque enough to hide the page behind it."""
+    if (spec.get('width') or 0) < 340 or (spec.get('height') or 0) < 340:
+        return False
+    opa = spec.get('bg_opa', 'COVER')
+    if isinstance(opa, str):
+        text = opa.strip().upper()
+        if text in ('COVER', 'TRANSP'):
+            return text == 'COVER'
+        text = text.rstrip('%')
+        try:
+            return float(text) >= 90
+        except ValueError:
+            return False
+    return float(opa) >= 90
+
+
+def _conv_width(match):
+    """An explicit field width is a promise about the output.
+
+    %02d is two characters. An unknown %d has to be assumed wider, and five
+    is the standing assumption -- but applying five to both scored
+    "%02d:%02d" as eleven characters, and the clock then failed on a string
+    it cannot produce.
+    """
+    declared = match.group(1)
+    return '#' * (int(declared) if declared else 5)
+
+
+def compared_literals(src):
+    """Literals sitting next to an equality test: operands, not output.
+
+    "unavailable" in `if (id(x).state == "unavailable")` is not something the
+    label can ever hold. Counting it put val_ac's worst case at eleven
+    characters of 60px type -- 389px into a 335px chord -- for a label whose
+    job is to print "24". Found by position rather than by a second pattern,
+    because the literal pattern already knows where every one of them is.
+    """
+    out = set()
+    for found in LITERAL.finditer(src):
+        near = src[max(0, found.start() - 4):found.start()] +             src[found.end():found.end() + 4]
+        if '==' in near or '!=' in near:
+            out.add(found.group(1))
+    return out
+
+
 def worst_case(rec, declared_font, strings):
     """Widest (px, font, chars, unbounded) over every write to this label.
 
@@ -124,11 +193,29 @@ def worst_case(rec, declared_font, strings):
     worst = (0.0, declared_font, 0, False)
     for font, src in rec:
         f = font or declared_font
-        unb = any(n in strings for n in IDREF.findall(src))
+        # Naming a text sensor is not printing one. This was `any(id in
+        # strings)`, so a lambda that read id(ha_ac_mode).state to pick a
+        # branch had its label judged as carrying 24 arbitrary characters:
+        # every big value on the bedside knob failed at once, all of them
+        # printing two digits. Five false failures in a seven-line report is
+        # how a report stops being read, which is what let a real one sit in
+        # it. A string is unbounded only where it reaches the glass -- as a
+        # %s argument, or returned as the value.
+        unb = False
+        for ref in IDREF.findall(src):
+            if ref not in strings:
+                continue
+            if re.search(r'%[-+0-9.*]*s', src) or re.search(
+                    r'return[^;]*id\(\s*' + re.escape(ref) + r'\s*\)', src):
+                unb = True
+                break
+        compared = compared_literals(src)
         n = 0
         for lit in LITERAL.findall(src):
+            if lit in compared:
+                continue
             if '%' in lit:
-                lit = re.sub(r'%[-+0-9.]*[a-z]', '#####', lit)
+                lit = CONV.sub(_conv_width, lit)
             n = max(n, len(lit))
         if unb:
             n = max(n, UNBOUNDED_CHARS)
@@ -140,6 +227,8 @@ def worst_case(rec, declared_font, strings):
 
 def main(path):
     cfg = yaml.load(open(path, encoding='utf-8').read(), Loader=Loader)
+    # Before any measuring: the sizes belong to the config, not to this file.
+    register_fonts(cfg)
     writes = label_writes(cfg)
     strings = string_sources(cfg)
     glyphs = set()
@@ -165,9 +254,10 @@ def main(path):
     solids = {}
     for idx, (page, kind, spec) in enumerate(collect(cfg)):
         if kind in ('button', 'obj') and spec.get('bg_color') is not None:
+            sox, soy = ORIGIN.get(id(spec), (0, 0))
             solids.setdefault(page, []).append(
-                (spec.get('id', '(anon)'), spec.get('x', 0) or 0,
-                 spec.get('y', 0) or 0, spec.get('width', 0),
+                (spec.get('id', '(anon)'), sox + (spec.get('x', 0) or 0),
+                 soy + (spec.get('y', 0) or 0), spec.get('width', 0),
                  spec.get('height', 0), idx))
 
     for label_idx, (page, kind, spec) in enumerate(collect(cfg)):
@@ -177,7 +267,9 @@ def main(path):
         if spec.get('align', 'TOP_LEFT') != 'CENTER':
             continue
         checked += 1
-        x, y = spec.get('x', 0) or 0, spec.get('y', 0) or 0
+        ox, oy = ORIGIN.get(id(spec), (0, 0))
+        x = ox + (spec.get('x', 0) or 0)
+        y = oy + (spec.get('y', 0) or 0)
         declared_font = spec.get('text_font', DEFAULT_FONT)
         bounded_by_widget = (spec.get('width') is not None
                              and spec.get('long_mode'))
@@ -216,6 +308,11 @@ def main(path):
         for sid, sx, sy, sw, sh, solid_idx in solids.get(page, []):
             if label_idx > solid_idx:
                 continue
+            # A label nested inside the solid is its child, and LVGL draws
+            # children above their parent. Treating the two as siblings
+            # reported every button's own caption as invisible.
+            if sid in PARENTS.get(id(spec), ()):
+                continue
             if (abs(y - sy) < (h + sh) / 2 and abs(x - sx) < (w + sw) / 2):
                 errors.append(
                     '%s/%s at (%+d,%+d) is behind %s, which is opaque and '
@@ -229,6 +326,80 @@ def main(path):
                 'of glass at that height -- off the edge by %.0fpx'
                 % (page, wid, x, y, font, w,
                    half_chord(abs(y) + h / 2) * 2, over * 2))
+
+    # Two labels in the same place. Neither the chord check nor the opaque
+    # check sees this: text has no background, so a label does not hide
+    # another one the way a button does -- the glyphs simply interleave and
+    # both become unreadable. It has now cost three placements. chip_clock
+    # went in at y -140 spanning -149..-131 while page_lights' title spans
+    # -132..-104, and this file reported no errors at all.
+    #
+    # Judged on the text a label can actually hold, never on the 24-character
+    # assumption the width check uses: applied here that would put every
+    # runtime label on top of its neighbours and the result would be ignored.
+    # A label drawn over a veil is not in the same place as what the veil
+    # is covering. lbl_offline sits above a 98%-opaque full-screen obj, so
+    # every big value on every page reported a collision with it -- six
+    # failures describing a screen where, by design, only one of the two is
+    # visible. The occlusion check above deliberately ignores opacity
+    # because a near-opaque overlay hides a label; the same fact exempts a
+    # label drawn on top of one.
+    veiled = set()
+    for name in ('top_layer', 'bottom_layer'):
+        layer = (cfg.get('lvgl') or {}).get(name)
+        if not isinstance(layer, dict):
+            continue
+        flat = []
+        walk(layer.get('widgets'), name, flat)
+        covers_from = None
+        for idx, (_, kind, spec) in enumerate(flat):
+            if kind in ('obj', 'button') and _covers_glass(spec):
+                covers_from = idx if covers_from is None else covers_from
+            elif kind == 'label' and covers_from is not None                     and idx > covers_from:
+                veiled.add(id(spec))
+
+    boxes = []
+    for page, kind, spec in collect(cfg):
+        if kind != 'label' or spec.get('align', 'TOP_LEFT') != 'CENTER':
+            continue
+        if spec.get('hidden'):
+            continue
+        wid = spec.get('id') or '(anon)'
+        font = spec.get('text_font', DEFAULT_FONT)
+        chars = len(str(spec.get('text', '')) or '')
+        if wid in writes:
+            for wf, src in writes[wid]:
+                cmp_lits = compared_literals(src)
+                for lit in LITERAL.findall(src):
+                    if lit in cmp_lits:
+                        continue
+                    chars = max(chars, len(CONV.sub(_conv_width, lit)
+                                           if '%' in lit else lit))
+                font = wf or font
+        ox, oy = ORIGIN.get(id(spec), (0, 0))
+        boxes.append((page, wid, id(spec),
+                      ox + (spec.get('x', 0) or 0), oy + (spec.get('y', 0) or 0),
+                      text_width('x' * max(chars, 1), font), text_height(font)))
+
+    for i, (pa, ia, sa, xa, ya, wa, ha) in enumerate(boxes):
+        for pb, ib, sb, xb, yb, wb, hb in boxes[i + 1:]:
+            # A layer draws over every page, so it is checked against all of
+            # them; two different pages are never on the glass together.
+            layered = pa in ('top_layer', 'bottom_layer') or                 pb in ('top_layer', 'bottom_layer')
+            if pa != pb and not layered:
+                continue
+            if sa in PARENTS.get(sb, ()) or sb in PARENTS.get(sa, ()):
+                continue
+            # One of them is over a veil and the other is behind it.
+            if layered and pa != pb and (sa in veiled or sb in veiled):
+                continue
+            dy = (ha + hb) / 2 - abs(ya - yb)
+            dx = (wa + wb) / 2 - abs(xa - xb)
+            if dy > 0 and dx > 0:
+                errors.append(
+                    '%s/%s and %s/%s overlap by %.0fx%.0fpx -- two labels in '
+                    'the same place, and neither has a background to hide '
+                    'behind' % (pa, ia, pb, ib, dx, dy))
 
     for w in warnings:
         print('WARN  ' + w)

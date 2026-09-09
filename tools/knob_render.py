@@ -21,7 +21,7 @@ import yaml
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from knob_geometry import SIZE
+from knob_geometry import register_fonts, text_height, SIZE
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -45,13 +45,19 @@ def find_font():
 
 
 FONT_PATH = find_font()
-SIZES = {'montserrat_16': 16, 'montserrat_20': 20, 'montserrat_48': 48,
-         'mdi_40': 40}
 _cache = {}
 
 
 def font(name):
-    px = SIZES.get(name, 16)
+    """Size comes from the config, via knob_geometry.register_fonts().
+
+    The table this replaced listed the coffee knob's four fonts and defaulted
+    everything else to 16px, so rendering the bedside knob drew its 60px clock
+    at 16px -- a picture that made a layout look roomier than the device would.
+    A render that flatters the design is the one failure this tool exists to
+    prevent, so an unresolvable font is now an error.
+    """
+    px = int(text_height(name))
     if px not in _cache:
         _cache[px] = ImageFont.truetype(FONT_PATH, px)
     return _cache[px]
@@ -97,16 +103,28 @@ def rgb(v, default=(255, 255, 255)):
 
 
 def widgets_of(page):
+    """Every widget, flattened, each with the origin its x/y is measured from.
+
+    A nested widget is positioned relative to its PARENT. Drawing it at raw
+    x/y put page_lights' six button captions on the same spot in the middle
+    of the glass, three buttons' worth of text as one unreadable blob, on a
+    page that looks fine on the device. A render is the only place a layout
+    gets looked at before it is flashed, so one that draws the wrong picture
+    is worse than none.
+    """
     out = []
 
-    def walk(ws):
+    def walk(ws, ox=0, oy=0):
         for w in ws or []:
             if not isinstance(w, dict):
                 continue
             for kind in ('label', 'arc', 'obj', 'image', 'button'):
                 if kind in w and isinstance(w[kind], dict):
-                    out.append((kind, w[kind]))
-                    walk(w[kind].get('widgets'))
+                    spec = w[kind]
+                    out.append((kind, spec, ox, oy))
+                    walk(spec.get('widgets'),
+                         ox + (spec.get('x', 0) or 0),
+                         oy + (spec.get('y', 0) or 0))
     walk(page.get('widgets'))
     return out
 
@@ -119,12 +137,13 @@ def render(page, state, layer=None):
     # top_layer draws over every page on the device, so leaving it out of the
     # render makes the picture disagree with the glass on nine screens at
     # once. Appended after the page so the z-order matches LVGL's.
-    for kind, spec in widgets_of(page) + (widgets_of(layer) if layer else []):
+    for kind, spec, ox, oy in (widgets_of(page)
+                               + (widgets_of(layer) if layer else [])):
         wid = spec.get('id', '')
         if spec.get('hidden') and wid not in state:
             continue
-        x = spec.get('x', 0) or 0
-        y = spec.get('y', 0) or 0
+        x = ox + (spec.get('x', 0) or 0)
+        y = oy + (spec.get('y', 0) or 0)
 
         if kind == 'obj':
             w = spec.get('width', 0)
@@ -185,6 +204,7 @@ def render(page, state, layer=None):
 
 def main(cfg_path, page_id, states_path, out_path):
     cfg = yaml.load(open(cfg_path, encoding='utf-8').read(), Loader=Loader)
+    register_fonts(cfg)
     page = next((p for p in (cfg.get('lvgl') or {}).get('pages') or []
                  if p.get('id') == page_id), None)
     layer = (cfg.get('lvgl') or {}).get('top_layer')
