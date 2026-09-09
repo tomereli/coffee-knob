@@ -574,6 +574,20 @@ sensor:
       - lambda: 'id(batt_pct) = std::isnan(x) ? -1 : (int) roundf(x);'
 
 text_sensor:
+  # The running firmware's own identity. ESPHome puts the config hash the
+  # binary was compiled from into this state, and build_info.json in the
+  # build directory carries the same number for what was just built: equal
+  # means the hardware is running THIS config and not the one before it.
+  #
+  # This exists because "the device rejoined the network" is the healthz of
+  # a knob -- necessary, cheap, and exactly the thing that stays green while
+  # the wrong image runs. ops/verify.py does the comparison, and refuses
+  # rather than passing when it cannot. The flash that introduces this
+  # sensor is the one flash it cannot check.
+  - platform: version
+    name: "Firmware"
+    entity_category: diagnostic
+
   - platform: homeassistant
     id: coffee_ready_txt
     entity_id: sensor.la_minea_micra_coffee_boiler_ready_time
