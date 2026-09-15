@@ -83,6 +83,12 @@ substitutions:
   # How long after the backlight comes up a press is treated as "wake only".
   wake_guard_ms:     "600"
   shot_full_scale_ds: "400"
+  # coffee-hub's LAN listener on the gaming PC. The app keeps the shot log
+  # that Home Assistant's to-do list used to hold badly, and this is the only
+  # address in this file that is not an entity id - change it here if the PC's
+  # address moves. 192.168.68.85 is the interface holding the default route;
+  # the other two on that machine answer as well.
+  coffee_hub_url: "http://192.168.68.85:3042"
 
 esphome:
   name: coffee-knob
@@ -143,6 +149,12 @@ api:
 ota:
   - platform: esphome
     password: !secret coffee_knob_ota_password
+
+# Plain HTTP on the house wifi, to one address. No TLS to verify, and the
+# shared secret is what the other end checks.
+http_request:
+  useragent: esphome/coffee-knob
+  timeout: 5s
 
 wifi:
   ssid: !secret wifi_ssid
@@ -1678,6 +1690,47 @@ script:
                           if (id(shot_ds) > 0) return id(shot_ds) / 10.0f;
                           float t = id(sync_time).state;
                           return std::isnan(t) ? 0.0f : t;
+                  # AND THE SAME VERDICT TO coffee-hub, which keeps the shot
+                  # log now. It is sent alongside the Home Assistant writes
+                  # rather than instead of them: the to-do list stays until the
+                  # app has been recording for a while, because a rating that
+                  # reaches neither is the one failure worth avoiding here.
+                  #
+                  # THE UUID IS WHAT MAKES IT ATTACH TO THE RIGHT SHOT. The
+                  # knob is holding grind_event_uuid for the shot on its glass,
+                  # so the rating lands on that shot and never on whatever
+                  # happens to be newest at the other end. Everything else in
+                  # the row -- dose, yield, time, grind, temperature -- the app
+                  # already has from the machines, so none of it is sent.
+                  #
+                  # Fire and forget. The app answers 404 for a shot it has not
+                  # polled yet, and that is logged rather than retried: its
+                  # poll runs every minute and the numbers are not the knob's
+                  # to supply.
+                  - if:
+                      condition:
+                        lambda: |-
+                          return !id(shot_uuid).state.empty()
+                                 && id(shot_uuid).state != "unknown"
+                                 && id(shot_uuid).state != "unavailable";
+                      then:
+                        - http_request.post:
+                            url: ${coffee_hub_url}/api/knob/rate
+                            capture_response: false
+                            request_headers:
+                              Content-Type: application/json
+                              X-Knob-Token: !secret coffee_hub_knob_token
+                            body: !lambda |-
+                              char buf[224];
+                              snprintf(buf, sizeof(buf),
+                                "{\"uuid\":\"%s\",\"served_as\":\"%s\","
+                                "\"taste\":%d,\"score\":%d}",
+                                id(shot_uuid).state.c_str(),
+                                id(serve_i) == 0 ? "espresso" : "milk",
+                                id(taste_val), id(rate_val));
+                              return std::string(buf);
+                            on_error:
+                              - logger.log: "coffee-hub did not take the rating"
                   - delay: 900ms
                   - script.execute: go_main
           else:
