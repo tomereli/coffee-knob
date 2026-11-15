@@ -1,0 +1,52 @@
+{
+ "path": "temp",
+ "outcome": "ignored",
+ "source": "Observed in HA history 2026-11-05..15: number.la_minea_micra_coffee_target_temperature held 94.5 for ten days apart from unavailable flaps, while the knob was used to change it. Modelled as a call HA accepts and a machine that never reports a new value.",
+ "events": [
+  [
+   0,
+   "machine",
+   94.5
+  ],
+  [
+   100,
+   "edit",
+   1
+  ],
+  [
+   200,
+   "knob",
+   96.0
+  ],
+  [
+   800,
+   "send"
+  ],
+  [
+   900,
+   "edit",
+   0
+  ],
+  [
+   8000,
+   "check"
+  ],
+  [
+   9000,
+   "check"
+  ]
+ ],
+ "expect": [
+  {
+   "at": 8000,
+   "temp_state": 1,
+   "coffee_temp_val": 96.0
+  },
+  {
+   "at": 9000,
+   "temp_state": 4,
+   "coffee_temp_val": 94.5,
+   "cfg_edit": 0
+  }
+ ]
+}

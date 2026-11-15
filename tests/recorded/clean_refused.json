@@ -1,0 +1,27 @@
+{
+ "path": "clean",
+ "outcome": "refused",
+ "source": "Timing observed in HA traces of automation.coffee_on_when_tomer_or_masha_arrives on 2026-11-14 14:11 UTC: switch.turn_on on switch.la_minea_micra refused in 0.32-0.40 s with 'Error while turning on switch main'. The same integration's refusal for button.press uses its own error template, quoted here; the text itself is not checked by the knob.",
+ "events": [
+  [
+   0,
+   "press"
+  ],
+  [
+   400,
+   "clean_error",
+   "Error while executing button start_backflush"
+  ],
+  [
+   500,
+   "check"
+  ]
+ ],
+ "expect": [
+  {
+   "at": 500,
+   "clean_state": 3,
+   "clean_running": 0
+  }
+ ]
+}

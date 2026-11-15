@@ -1,0 +1,35 @@
+{
+ "path": "clean",
+ "outcome": "confirmed",
+ "source": "The cloud push arrives after the knob has called it. The machine is cleaning, so the knob must follow it -- on_press stops clean_failed and restarts the cycle screen.",
+ "events": [
+  [
+   0,
+   "press"
+  ],
+  [
+   11000,
+   "check"
+  ],
+  [
+   12000,
+   "active"
+  ],
+  [
+   12100,
+   "check"
+  ]
+ ],
+ "expect": [
+  {
+   "at": 11000,
+   "clean_state": 4,
+   "clean_running": 0
+  },
+  {
+   "at": 12100,
+   "clean_state": 4,
+   "clean_running": 1
+  }
+ ]
+}
