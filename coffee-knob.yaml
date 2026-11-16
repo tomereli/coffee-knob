@@ -79,6 +79,14 @@ substitutions:
   # Machine-measured: paddle window ~15 s, full cycle ~90 s from the ON edge.
   clean_arm_ds:      "160"
   clean_total_ds:    "900"
+  # How long a write to the machine may take to show up in its own reported
+  # state before the knob calls it ignored. Home Assistant answering "ok" only
+  # means the integration took the call; the machine's state is the proof.
+  # NOT MEASURED: no press-to-confirm latency has been recorded yet. These
+  # are guesses, and the clean one sits inside the ~15 s paddle window so a
+  # silent failure is called before that window would have closed anyway.
+  temp_confirm_ms:   "8000"
+  clean_confirm_ms:  "10000"
   screen_timeout:    5min
   # How long after the backlight comes up a press is treated as "wake only".
   wake_guard_ms:     "600"
@@ -455,6 +463,7 @@ sensor:
     internal: true
     on_value:
       - lambda: 'if (!id(cfg_edit)) id(coffee_temp_val) = x;'
+      - script.execute: temp_judge
       - script.execute: paint_cfg
       - script.execute: paint_boil
 
@@ -909,10 +918,14 @@ binary_sensor:
     entity_category: diagnostic
     entity_id: $micra_cleaning
     on_press:
+      # A confirmation that lands after the knob gave up still wins: the
+      # machine is cleaning, so the failure screen must not send it home.
+      - script.stop: clean_failed
       - lambda: |-
           id(clean_ds) = 0;
           id(clean_running) = true;
           id(clean_confirmed) = true;
+      - script.execute: clean_judge
       - light.turn_on: back_light
       - script.execute: screentime
       - script.execute: paint_clean
@@ -975,6 +988,47 @@ globals:
     type: float
     restore_value: false
     initial_value: '93.0f'
+  # Every write to the machine is judged by what the machine reports back,
+  # not by the knob having sent it. Issue #2: from 1 Nov the La Marzocco
+  # integration refused every write, the knob ignored the refusal, and the
+  # screen showed a temperature the machine never took.
+  #   0 idle, 1 sent and waiting, 2 machine confirms,
+  #   3 Home Assistant refused it, 4 accepted but the machine never changed
+  - id: temp_state
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: temp_sent
+    type: float
+    restore_value: false
+    initial_value: '0.0f'
+  - id: temp_sent_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: temp_err
+    type: std::string
+    restore_value: false
+  - id: temp_news
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # Same five states for the backflush start.
+  - id: clean_state
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: clean_req_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: clean_err
+    type: std::string
+    restore_value: false
+  - id: clean_news
+    type: bool
+    restore_value: false
+    initial_value: 'false'
   # Local editable copy of the target ratio, same pattern as coffee_temp_val:
   # held while the knob is turning so the display does not fight the
   # round-trip, pushed to HA once the knob stops.
@@ -2153,11 +2207,84 @@ script:
                 id(clean_ds) = 0;
                 id(clean_running) = true;
                 id(clean_confirmed) = false;
+                id(clean_req_ms) = millis();
+                id(clean_err) = "";
+                id(clean_state) = 1;
             - script.execute: paint_clean
             - homeassistant.action:
                 action: button.press
                 data:
                   entity_id: $micra_backflush
+                # Pressing only asks. A refusal comes back here and nowhere
+                # else -- Home Assistant does not log it.
+                on_error:
+                  - lambda: |-
+                      ESP_LOGW("write", "backflush start refused: %s",
+                               error.c_str());
+                      id(clean_err) = error.empty() ? std::string("refused") : error;
+                  - script.execute: clean_judge
+
+  # Decides what a backflush start came to: the machine reporting
+  # backflush_active is the only proof it started. Compiled as it stands by
+  # tests/test_write_paths.py -- keep it to globals, millis() and
+  # substitutions.
+  - id: clean_judge
+    mode: queued
+    then:
+      - lambda: |-
+          if (id(clean_state) != 1) return;
+          if (!id(clean_err).empty()) {
+            id(clean_state) = 3;
+          } else if (id(clean_confirmed)) {
+            id(clean_state) = 2;
+          } else if (millis() - id(clean_req_ms) > (uint32_t) $clean_confirm_ms) {
+            id(clean_state) = 4;
+          } else {
+            return;
+          }
+          if (id(clean_state) >= 3) {
+            id(clean_running) = false;
+            id(clean_news) = true;
+          }
+      - script.execute: paint_clean
+      - if:
+          condition:
+            lambda: 'return id(clean_news);'
+          then:
+            - lambda: 'id(clean_news) = false;'
+            - script.execute: clean_failed
+
+  - id: clean_failed
+    mode: restart
+    then:
+      - script.execute:
+          id: haptic
+          effect: 47
+      - lvgl.label.update:
+          id: lbl_clean_head
+          text: !lambda |-
+            return std::string(id(clean_state) == 3 ? "REFUSED" : "NO START");
+          text_color: 0xE8A33D
+      - lvgl.label.update:
+          id: lbl_clean_big
+          text: ""
+      - lvgl.label.update:
+          id: lbl_clean_sub
+          text: !lambda |-
+            return std::string(id(clean_state) == 3
+                               ? "machine refused the start"
+                               : "machine never reported one");
+      - lvgl.arc.update:
+          id: arc_clean
+          value: 0
+          indicator:
+            arc_color: 0xE8A33D
+      - delay: 6s
+      - if:
+          condition:
+            lvgl.page.is_showing: page_clean
+          then:
+            - script.execute: go_main
 
   # Two phases on one screen, told apart purely by elapsed time on
   # micra_cleaning: under ~16 s the machine is still waiting for the paddle,
@@ -2167,12 +2294,19 @@ script:
     then:
       - lvgl.label.update:
           id: lbl_clean_head
+          # STARTING until the machine itself reports the cycle. MOVE THE
+          # PADDLE is the knob saying the machine has started; it is not shown
+          # on the strength of the knob having asked.
           text: !lambda |-
             if (id(clean_waking)) return std::string("WAKING MACHINE");
+            if (id(clean_state) == 1 && !id(clean_confirmed))
+              return std::string("STARTING");
             return std::string(id(clean_ds) < (uint32_t) $clean_arm_ds
                                ? "MOVE THE PADDLE" : "CLEANING");
           text_color: !lambda |-
             if (id(clean_waking)) return lv_color_hex(0xE8A33D);
+            if (id(clean_state) == 1 && !id(clean_confirmed))
+              return lv_color_hex(0xE8A33D);
             return lv_color_hex(id(clean_ds) < (uint32_t) $clean_arm_ds
                                 ? 0x4FA3E3 : 0xE31E24);
       - lvgl.label.update:
@@ -2188,6 +2322,8 @@ script:
             static char b[40];
             if (id(clean_waking))
               return std::string("the pump needs it awake");
+            if (id(clean_state) == 1 && !id(clean_confirmed))
+              return std::string("waiting for the machine");
             if (id(clean_ds) >= (uint32_t) $clean_arm_ds)
               return std::string("seconds elapsed");
             // Small type, because it is the caveat and not the news: the
@@ -2381,6 +2517,18 @@ script:
     mode: restart
     then:
       - delay: 600ms
+      - script.execute: send_temp
+
+  # The one place the coffee temperature is written. push_temp and the
+  # recipe presets both come through here, so both get the same judgement.
+  - id: send_temp
+    mode: restart
+    then:
+      - lambda: |-
+          id(temp_sent) = id(coffee_temp_val);
+          id(temp_sent_ms) = millis();
+          id(temp_err) = "";
+          id(temp_state) = 1;
       - homeassistant.action:
           action: number.set_value
           data:
@@ -2388,7 +2536,57 @@ script:
           data_template:
             value: "{{ t }}"
           variables:
-            t: !lambda 'return id(coffee_temp_val);'
+            t: !lambda 'return id(temp_sent);'
+          # Home Assistant logs nothing when a call from an ESPHome device
+          # fails. This is the only place the refusal is ever seen.
+          on_error:
+            - lambda: |-
+                ESP_LOGW("write", "coffee temp %.1f refused: %s",
+                         id(temp_sent), error.c_str());
+                id(temp_err) = error.empty() ? std::string("refused") : error;
+            - script.execute: temp_judge
+      - script.execute: paint_cfg
+
+  # Decides what a temperature write came to. Runs on every machine update,
+  # on a refusal, and twice a second while a write is outstanding.
+  # tests/test_write_paths.py compiles this lambda as it stands -- keep it
+  # to globals, coffee_temp, millis() and substitutions.
+  - id: temp_judge
+    mode: queued
+    then:
+      - lambda: |-
+          if (id(temp_state) != 1) return;
+          float m = id(coffee_temp).state;
+          bool have = !std::isnan(m);
+          if (!id(temp_err).empty()) {
+            id(temp_state) = 3;
+          } else if (have && std::fabs(m - id(temp_sent)) < 0.05f) {
+            id(temp_state) = 2;
+            return;
+          } else if (millis() - id(temp_sent_ms) > (uint32_t) $temp_confirm_ms) {
+            id(temp_state) = 4;
+          } else {
+            return;
+          }
+          // Not taken. Leave the editor and show what the machine is
+          // actually holding, never the number that was sent.
+          id(cfg_edit) = false;
+          if (have) id(coffee_temp_val) = m;
+          id(temp_news) = true;
+          ESP_LOGW("write", "coffee temp %.1f not taken, machine holds %.1f",
+                   id(temp_sent), m);
+      # Once per failure. The returns above only leave the lambda, so without
+      # this every later machine update would buzz again.
+      - if:
+          condition:
+            lambda: 'return id(temp_news);'
+          then:
+            - lambda: 'id(temp_news) = false;'
+            - script.execute:
+                id: haptic
+                effect: 47
+      - script.execute: paint_cfg
+      - script.execute: paint_boil
 
   # Same debounce as push_temp: a fast spin should not fire twenty writes.
   - id: push_ratio
@@ -2493,14 +2691,7 @@ script:
               return !id(cfg_edit) && i >= 0 && i <= 2 && id(preset_temp)[i] > 1.0f;
           then:
             - lambda: 'id(coffee_temp_val) = id(preset_temp)[id(recipe_i)];'
-            - homeassistant.action:
-                action: number.set_value
-                data:
-                  entity_id: $micra_temp
-                data_template:
-                  value: "{{ t }}"
-                variables:
-                  t: !lambda 'return id(coffee_temp_val);'
+            - script.execute: send_temp
       - if:
           condition:
             lambda: |-
@@ -2587,7 +2778,12 @@ script:
               if (i == 8 || i == 9) return id(preinf_mode_val) == 1;
               return i == 2 || i == 3 || i == 4 || i == 5;
           then:
-            - lambda: 'id(cfg_edit) = !id(cfg_edit);'
+            - lambda: |-
+                id(cfg_edit) = !id(cfg_edit);
+                // A fresh edit starts with a clean slate; an old refusal is
+                // not news about the value about to be sent.
+                if (id(cfg_edit) && id(cfg_i) == 2 && id(temp_state) != 1)
+                  id(temp_state) = 0;
       - if:
           condition:
             lambda: 'return id(cfg_i) == 6;'
@@ -2689,12 +2885,18 @@ script:
                   static char b[10];
                   snprintf(b, sizeof(b), "%.1f", id(coffee_temp_val));
                   return b;
+            # The verdict on the last write, in words. The value above is
+            # always the machine's own once a write is settled.
             - lvgl.label.update:
                 id: lbl_cfg_hint
                 text: !lambda |-
-                  std::string s = id(cfg_edit) ? "turn to set, tap to save"
-                                               : "tap to adjust";
-                  return s;
+                  int st = id(temp_state);
+                  if (st == 3) return std::string("machine refused it");
+                  if (st == 4) return std::string("machine did not take it");
+                  if (id(cfg_edit)) return std::string("turn to set, tap to save");
+                  if (st == 1) return std::string("sending to machine");
+                  if (st == 2) return std::string("set on the machine");
+                  return std::string("tap to adjust");
       # The one number on this page that is a matter of taste rather than a
       # machine setting -- and the reason a 1:1.72 shot was showing a red
       # ring. Editable here so it can be corrected standing at the machine,
@@ -3222,6 +3424,21 @@ interval:
   - interval: 2s
     then:
       - script.execute: paint_link
+
+  # An ignored write is an absence too: nothing arrives to say the machine
+  # did not change. Judge outstanding writes on a clock.
+  - interval: 500ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(temp_state) == 1;'
+          then:
+            - script.execute: temp_judge
+      - if:
+          condition:
+            lambda: 'return id(clean_state) == 1;'
+          then:
+            - script.execute: clean_judge
 
   - interval: 100ms
     then:

@@ -1,0 +1,52 @@
+{
+ "path": "temp",
+ "outcome": "confirmed",
+ "source": "The working path before 1 Nov: the machine reports the new target back and HA's state follows. Latency not measured; 1.2 s chosen to land inside the editor.",
+ "events": [
+  [
+   0,
+   "machine",
+   94.5
+  ],
+  [
+   100,
+   "edit",
+   1
+  ],
+  [
+   200,
+   "knob",
+   95.0
+  ],
+  [
+   800,
+   "send"
+  ],
+  [
+   2000,
+   "state",
+   95.0
+  ],
+  [
+   2100,
+   "check"
+  ],
+  [
+   20000,
+   "check"
+  ]
+ ],
+ "expect": [
+  {
+   "at": 2100,
+   "temp_state": 2,
+   "coffee_temp_val": 95.0,
+   "cfg_edit": 1
+  },
+  {
+   "at": 20000,
+   "temp_state": 2,
+   "coffee_temp_val": 95.0
+  }
+ ]
+}

@@ -1,0 +1,110 @@
+// Generated around the lambdas in coffee-knob.yaml by tests/test_write_paths.py.
+// The marker lines are replaced with the shipped lambda bodies verbatim,
+// so this tests the code that is flashed, not a copy of it.
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
+#include <sstream>
+#include <string>
+
+static uint32_t NOW = 0;
+static uint32_t millis() { return NOW; }
+#define ESP_LOGW(tag, ...) (std::fprintf(stderr, __VA_ARGS__), std::fprintf(stderr, "\n"))
+
+struct Sensor { float state; };
+
+struct Globals {
+  // temperature path
+  int temp_state = 0;
+  float temp_sent = 0.0f;
+  uint32_t temp_sent_ms = 0;
+  std::string temp_err;
+  bool temp_news = false;
+  Sensor coffee_temp{NAN};
+  float coffee_temp_val = 0.0f;
+  bool cfg_edit = false;
+  // clean path
+  int clean_state = 0;
+  uint32_t clean_req_ms = 0;
+  std::string clean_err;
+  bool clean_news = false;
+  bool clean_confirmed = false;
+  bool clean_running = false;
+  uint32_t clean_ds = 0;
+} g;
+
+#define id(x) g.x
+
+static void temp_on_value(float x) {
+@@TEMP_ON_VALUE@@
+}
+static void send_temp() {
+@@SEND_TEMP@@
+}
+static void temp_on_error(const std::string &error) {
+@@TEMP_ON_ERROR@@
+}
+static void temp_judge() {
+@@TEMP_JUDGE@@
+}
+static void clean_start() {
+@@CLEAN_START@@
+}
+static void clean_on_error(const std::string &error) {
+@@CLEAN_ON_ERROR@@
+}
+static void clean_on_press() {
+@@CLEAN_ON_PRESS@@
+}
+static void clean_judge() {
+@@CLEAN_JUDGE@@
+}
+
+static void report() {
+  std::printf("t=%u temp_state=%d coffee_temp_val=%.2f cfg_edit=%d "
+              "clean_state=%d clean_running=%d\n",
+              (unsigned) NOW, g.temp_state, g.coffee_temp_val, (int) g.cfg_edit,
+              g.clean_state, (int) g.clean_running);
+}
+
+// stdin: one event per line, "<ms> <kind> [arg...]", in time order.
+// The 500 ms interval that judges outstanding writes runs between events,
+// exactly as the device's `interval: 500ms` does.
+int main() {
+  std::string line;
+  uint32_t next_tick = 500;
+  auto advance = [&](uint32_t to) {
+    while (next_tick <= to) {
+      NOW = next_tick;
+      if (g.temp_state == 1) temp_judge();
+      if (g.clean_state == 1) clean_judge();
+      next_tick += 500;
+    }
+    NOW = to;
+  };
+  while (std::getline(std::cin, line)) {
+    if (line.empty()) continue;
+    std::istringstream in(line);
+    uint32_t t; std::string kind;
+    in >> t >> kind;
+    std::string rest;
+    std::getline(in, rest);
+    if (!rest.empty() && rest[0] == ' ') rest.erase(0, 1);
+    advance(t);
+    if (kind == "machine") { g.coffee_temp.state = std::strtof(rest.c_str(), nullptr); g.coffee_temp_val = g.coffee_temp.state; }
+    else if (kind == "edit") g.cfg_edit = rest == "1";
+    else if (kind == "knob") g.coffee_temp_val = std::strtof(rest.c_str(), nullptr);
+    else if (kind == "send") send_temp();
+    else if (kind == "temp_error") { temp_on_error(rest); temp_judge(); }
+    else if (kind == "state") { float x = std::strtof(rest.c_str(), nullptr); g.coffee_temp.state = x; temp_on_value(x); temp_judge(); }
+    else if (kind == "press") clean_start();
+    else if (kind == "clean_error") { clean_on_error(rest); clean_judge(); }
+    else if (kind == "active") { clean_on_press(); clean_judge(); }
+    else if (kind == "check") report();
+    else { std::fprintf(stderr, "unknown event %s\n", kind.c_str()); return 3; }
+  }
+  report();
+  return 0;
+}

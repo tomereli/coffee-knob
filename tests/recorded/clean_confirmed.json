@@ -1,0 +1,35 @@
+{
+ "path": "clean",
+ "outcome": "confirmed",
+ "source": "HA history 2026-11-08 21:51:27: backflush_active on, off at 21:52:55 -- a real cycle (started from the app). Press-to-on latency is not measured; 2 s assumed.",
+ "events": [
+  [
+   0,
+   "press"
+  ],
+  [
+   2000,
+   "active"
+  ],
+  [
+   2100,
+   "check"
+  ],
+  [
+   30000,
+   "check"
+  ]
+ ],
+ "expect": [
+  {
+   "at": 2100,
+   "clean_state": 2,
+   "clean_running": 1
+  },
+  {
+   "at": 30000,
+   "clean_state": 2,
+   "clean_running": 1
+  }
+ ]
+}

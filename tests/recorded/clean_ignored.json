@@ -1,0 +1,31 @@
+{
+ "path": "clean",
+ "outcome": "ignored",
+ "source": "Issue #2: 'if I try to start self-cleaning, it does not really start'. HA accepts the press and binary_sensor.la_minea_micra_backflush_active never turns on.",
+ "events": [
+  [
+   0,
+   "press"
+  ],
+  [
+   9500,
+   "check"
+  ],
+  [
+   10500,
+   "check"
+  ]
+ ],
+ "expect": [
+  {
+   "at": 9500,
+   "clean_state": 1,
+   "clean_running": 1
+  },
+  {
+   "at": 10500,
+   "clean_state": 4,
+   "clean_running": 0
+  }
+ ]
+}

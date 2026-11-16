@@ -1,0 +1,37 @@
+{
+ "path": "temp",
+ "outcome": "confirmed",
+ "source": "The machine settles on a different value than was sent (it rounds or clamps). The knob must show the machine's number, not its own.",
+ "events": [
+  [
+   0,
+   "machine",
+   94.5
+  ],
+  [
+   200,
+   "knob",
+   104.0
+  ],
+  [
+   800,
+   "send"
+  ],
+  [
+   1500,
+   "state",
+   100.0
+  ],
+  [
+   9500,
+   "check"
+  ]
+ ],
+ "expect": [
+  {
+   "at": 9500,
+   "temp_state": 4,
+   "coffee_temp_val": 100.0
+  }
+ ]
+}

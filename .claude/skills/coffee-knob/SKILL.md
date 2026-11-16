@@ -118,6 +118,27 @@ state this device latches on a `homeassistant` binary_sensor needs an
 explicit `has_state()` check somewhere that runs periodically -- an edge that
 never arrives cannot clear a flag.
 
+**A write is not done until the machine says so (issue #2).** From 1 Nov 2026
+the La Marzocco integration refused every write to the machine -- the
+temperature, the backflush button, the power switch -- in about 0.3 s, while
+reads kept working. Home Assistant does not log a failed `homeassistant.action`
+from an ESPHome device, and the knob ignored the result, so for two weeks the
+knob showed a temperature it had never set and a clean that never started.
+The rules that came out of it:
+
+- Every `homeassistant.action` that changes the machine carries `on_error:`.
+  The `error` string there is the only place a refusal is ever seen.
+- Success from Home Assistant only means the integration took the call. A
+  write is confirmed by the machine's own entity changing to the sent value
+  (`temp_judge`, `clean_judge`), and called ignored after a timeout.
+- Once a write is settled the screen shows the machine's value, never the
+  number that was sent.
+- One writer per machine setting (`send_temp`), so every path gets judged.
+- `tests/test_write_paths.py` compiles the judging lambdas straight out of
+  this YAML and replays recorded answers. Change them and the tests change
+  with them. `ops/write_check.py --set` is the live check, and it moves the
+  real machine, so it runs only when Tomer says so.
+
 ## The rating flow, and what it is for
 
 The user rates shots: serve (espresso/milk), taste (-2 sour .. +2 bitter),

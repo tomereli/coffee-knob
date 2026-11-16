@@ -130,6 +130,22 @@ LVGL rejects a rotated display and rotates touch input itself via `rotate_coordi
 
 When you adopt an ESPHome device, **`allow_service_calls` defaults to off**. Every `homeassistant.action` silently does nothing, with no error anywhere. Settings → Devices & Services → ESPHome → Configure.
 
+### A refused write is silent unless the knob listens for it
+
+When a service call from an ESPHome device fails, Home Assistant logs nothing.
+In November 2026 the La Marzocco integration refused every write to the machine
+for two weeks. The knob kept showing a temperature it had never set, and nobody
+could see why. Every write to the machine now has an `on_error:`, and it counts
+only once the machine reports the new value back. Until then, the knob says
+*sending*, *refused* or *did not take it* instead of showing a number that
+looks set.
+
+```
+python -m pytest tests/                 # needs pyyaml, pytest and g++
+python ops/write_check.py               # read only
+python ops/write_check.py --set 94.6    # writes the real machine, reads it back
+```
+
 ### The La Marzocco power state bounces
 
 Calling `switch.toggle` on the machine produces this, and it does it from the HA UI too — the knob isn't involved:
